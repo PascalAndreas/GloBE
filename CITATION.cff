@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "GloBE: Global-Basis Experts for Mixture-of-Experts FFNs"
+authors:
+  - family-names: "GloBE"
+    given-names: "Team"
+repository-code: "https://github.com/PascalAndreas/GloBE"
+url: "https://github.com/PascalAndrea/GloBE"
+abstract: >
+  A drop-in Global-Basis Experts (GloBE) module for MoE FFNs that uses
+  a single global basis bank across all MoE layers, learns sparse
+  token-independent mixtures via entmax/sparsemax with temperature annealing,
+  and precomposes & caches expert weights for dense-like inference.
+keywords:
+  - "mixture of experts"
+  - "neural networks"
+  - "compression"
+  - "sparse mixtures"
+  - "basis decomposition"
+license: MIT
+version: "0.1.0"
+date-released: "2024-01-01"

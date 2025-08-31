@@ -1,0 +1,21 @@
+# @package _global_
+bank:
+  # Bank sizes
+  m_up: 128    # number of basis vectors for Up projection
+  m_gate: 128  # number of basis vectors for Gate projection
+  
+  # Rank configuration
+  r: null  # rank of basis (set to p by default, or p/2 for ablation)
+  
+  # Activation function in mixture path
+  activation:
+    type: "silu"  # or "tanh"
+  
+  # Initialization
+  init:
+    method: "svd"  # or "dict" for dictionary learning
+    seed: 42
+    
+  # Regularization
+  spectral_reg: 0.0  # spectral regularization on banks
+  orthogonal_reg: 0.0  # orthogonality regularization

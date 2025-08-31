@@ -1,0 +1,22 @@
+# @package _global_
+sparsity:
+  # Sparsity mapping
+  map: "entmax"  # or "sparsemax"
+  
+  # Entmax configuration
+  alpha: 1.5  # entmax alpha parameter
+  
+  # Temperature annealing
+  T0: 2.0           # initial temperature
+  target_support: 12  # target median support size
+  eta: 0.05         # annealing rate
+  min_temp: 0.1     # minimum temperature
+  
+  # Regularization
+  l1: 1.0e-4        # L1 regularization on mixture coefficients
+  
+  # Pruning
+  eps_prune: 1.0e-4  # epsilon for pruning small coefficients
+  
+  # Support tracking
+  support_ema_decay: 0.99  # EMA decay for support size tracking

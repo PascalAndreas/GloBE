@@ -1,0 +1,35 @@
+# Default GloBE configuration
+defaults:
+  - model: qwen15_moe_a2_7b
+  - bank: global
+  - sparsity: entmax
+  - train: recon
+  - cache: lru
+  - export: hf
+  - _self_
+
+# Hydra configuration
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra:job.num}
+
+# Wandb configuration
+wandb:
+  project: "globe"
+  entity: null  # Set your wandb entity
+  run_name: null  # Auto-generated if null
+  tags: ["globe", "moe", "basis"]
+  mode: "online"  # or "offline" or "disabled"
+
+# Random seed
+seed: 42
+
+# Device configuration
+device: "mps"  # "cuda" or "mps" or "cpu" or "auto"
+
+# Logging
+log_level: "INFO"
+log_interval: 100
