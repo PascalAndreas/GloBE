@@ -77,25 +77,13 @@
   - Forward pass combines shared expert output with routed expert output
   - Cache and precomposition logic should skip shared experts
 
-### 8. Bank Initialization Overhaul
-- **Issue**: Current `init_bank.py` is placeholder code that doesn't follow the refined training workflow
-- **Reference**: Refined plan in `globe_bank_initialization_training_workflow.md` developed with GPT-5
-- **Critical missing components**:
-  - **Z-score normalization**: Per-family standardization across experts with mean/scale recording
-  - **Proper warm start procedure**: Truncated SVD per expert with centroids-based bank initialization
-  - **Alternating minimization**: Coding step (entmax/sparsemax) + Dictionary step (MOD) + Adapter refit (OLS)
-  - **Temperature annealing**: Dynamic temperature control to target median support size
-  - **Comprehensive metrics**: Energy captured, effective rank, support sizes, atom coherence, etc.
-- **Files requiring complete overhaul**:
-  - `globe/init/init_bank.py` - Replace placeholder with proper alternating minimization
-  - `globe/init/zscore.py` - Integrate with bank initialization workflow
-- **Key workflow steps missing**:
-  1. Per-family Z-score normalization with scale recording
-  2. Truncated SVD warm start: W_i ≈ (U_r Σ_r)(V_r^T) → A_i^(0), B_i^(0)
-  3. Initial bank from centroids + NNLS for initial codes α_i^(0)
-  4. Alternating minimization loop with proper MOD updates
-  5. Temperature control with median support targeting
-  6. Normalization constant folding and export preparation
+### 8. Bank Initialization Overhaul ✅
+Implemented the full initialization workflow in `globe/init/init_bank.py`
+and `globe/init/zscore.py` following
+`globe_bank_initialization_training_workflow.md`. The new pipeline adds
+per-family Z-score normalization, truncated SVD warm starts, centroids-
+based bank seeding with NNLS codes, an alternating minimization loop,
+temperature annealing, and metric tracking.
 
 ## Integration Issues
 
