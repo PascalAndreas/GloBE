@@ -57,6 +57,16 @@ class ZScoreNormalizer:
                 "weight_shape": list(weight_list[0].shape),
                 "total_parameters": sum(w.numel() for w in weight_list),
             }
+
+    def fit_transform(self, expert_weights: Dict[str, List[Tensor]]) -> Dict[str, List[Tensor]]:
+        """Fit statistics and return normalized weights.
+
+        This is a thin convenience wrapper combining :meth:`fit` and
+        :meth:`transform` to streamline typical workflows.
+        """
+
+        self.fit(expert_weights)
+        return self.transform(expert_weights)
     
     def transform(self, expert_weights: Dict[str, List[Tensor]]) -> Dict[str, List[Tensor]]:
         """Apply z-score normalization to expert weights.
