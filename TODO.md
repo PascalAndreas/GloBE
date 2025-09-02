@@ -2,36 +2,17 @@
 
 ## Critical Issues to Fix
 
-### 1. Device Configuration Propagation
-- **Issue**: Device configuration from Hydra config (`default.yaml`) not properly propagated to evaluation functions
-- **Files affected**: 
-  - `globe/eval/latency_mem.py` - Line 484: `benchmark_globe_model()` doesn't pass device parameter
-  - `globe/eval/recon_metrics.py` - Line 27: Hardcoded device fallback without config integration
-- **Fix needed**: 
-  - Pass device from Hydra config through to evaluation classes
-  - Update convenience functions to accept device parameter
-  - Consider MPS (Metal Performance Shaders) compatibility for macOS
+### 1. Device Configuration Propagation ✅
+- Device from Hydra config now flows into evaluation utilities.
+- `benchmark_globe_model` and `ReconstructionEvaluator` accept a `device` parameter and perform automatic CUDA/MPS/CPU selection.
 
-### 2. Precision/Dtype Mismatch
-- **Issue**: Default precision is "fp16" but Qwen1.5-MoE-A2.7B uses bfloat16
-- **Files affected**:
-  - `globe/eval/latency_mem.py` - Line 453: Default precision="fp16"
-  - `globe/config/cache/lru.yaml` - Correctly uses "bf16"
-  - `globe/config/export/hf.yaml` - Correctly uses "bf16"
-- **Fix needed**: 
-  - Change default precision to "bf16" in benchmark functions
-  - Ensure consistency across all modules
-  - Add model-specific dtype detection
+### 2. Precision/Dtype Mismatch ✅
+- Default precision switched to "bf16" in benchmarking utilities.
+- Added automatic dtype detection from model parameters.
 
-### 3. MPS Device Compatibility
-- **Issue**: Code uses `torch.cuda` checks which won't work on macOS with MPS
-- **Files affected**:
-  - `globe/eval/latency_mem.py` - Lines 187, 258, 268-270, 284-285: CUDA-specific calls
-  - Multiple modules default to CUDA checks
-- **Fix needed**:
-  - Replace `torch.cuda.is_available()` with device-agnostic checks
-  - Handle MPS-specific memory management
-  - Add MPS synchronization where needed
+### 3. MPS Device Compatibility ✅
+- Replaced CUDA-only checks with device-agnostic helpers.
+- Added MPS-specific cache clearing, memory tracking, and synchronization.
 
 ## Missing Implementation Components
 
