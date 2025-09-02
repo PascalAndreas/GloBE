@@ -4,7 +4,7 @@ This module provides comprehensive metrics for evaluating the quality
 of GloBE reconstructions compared to original MoE expert weights.
 """
 
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import torch
 from torch import Tensor
 import numpy as np
@@ -17,14 +17,22 @@ from pathlib import Path
 
 class ReconstructionEvaluator:
     """Comprehensive evaluator for GloBE reconstruction quality."""
-    
-    def __init__(self, device: Optional[torch.device] = None):
+
+    def __init__(self, device: Optional[Union[str, torch.device]] = None):
         """Initialize reconstruction evaluator.
-        
+
         Args:
             device: Device for computations
         """
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+
+        self.device = torch.device(device)
     
     def evaluate_reconstruction(
         self,

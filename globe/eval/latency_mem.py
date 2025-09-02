@@ -38,24 +38,34 @@ class LatencyBenchmark:
     def __init__(
         self,
         device: Optional[torch.device] = None,
-        precision: str = "fp16",
+        precision: str = "bf16",
     ):
         """Initialize latency benchmark.
-        
+
         Args:
             device: Device for benchmarking
-            precision: Precision for benchmarking ("fp16", "bf16", "fp32")
+            precision: Precision for benchmarking ("fp16", "bf16", "fp32", "auto")
         """
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+
+        self.device = torch.device(device)
         self.precision = precision
-        
+
         # Set up precision
         if precision == "fp16":
             self.dtype = torch.float16
         elif precision == "bf16":
             self.dtype = torch.bfloat16
-        else:
+        elif precision == "fp32":
             self.dtype = torch.float32
+        else:  # auto detection
+            self.dtype = None
     
     def benchmark_model(
         self,
@@ -87,7 +97,12 @@ class LatencyBenchmark:
             "cache_results": {},
             "throughput_results": {},
         }
-        
+
+        # Infer precision from model if requested
+        if self.dtype is None:
+            self.dtype = next(model.parameters()).dtype
+            self.precision = str(self.dtype).replace("torch.", "")
+
         # Move model to device and set precision
         model = model.to(self.device, dtype=self.dtype)
         model.eval()
@@ -118,7 +133,7 @@ class LatencyBenchmark:
         # Save results if output directory specified
         if config.output_dir:
             self._save_results(results, config.output_dir)
-        
+
         return results
     
     def _generate_input(
@@ -184,8 +199,7 @@ class LatencyBenchmark:
                 _ = model(**input_data)
         
         # Clear cache and collect garbage
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._clear_cache()
         gc.collect()
         
         # Benchmark runs
@@ -252,39 +266,59 @@ class LatencyBenchmark:
             results["cache"] = cache_results
         
         return results
-    
+
     def _get_precise_time(self) -> float:
         """Get precise time measurement."""
-        if torch.cuda.is_available():
+        if self._is_cuda():
             torch.cuda.synchronize()
+        elif self._is_mps():
+            torch.mps.synchronize()
         return time.perf_counter()
     
     def _get_memory_stats(self) -> Dict[str, float]:
         """Get current memory statistics."""
         stats = {}
-        
+
         # GPU memory
-        if torch.cuda.is_available():
+        if self._is_cuda():
             stats["gpu_allocated_mb"] = torch.cuda.memory_allocated() / 1024**2
             stats["gpu_reserved_mb"] = torch.cuda.memory_reserved() / 1024**2
             stats["gpu_max_allocated_mb"] = torch.cuda.max_memory_allocated() / 1024**2
-        
+        elif self._is_mps():
+            stats["gpu_allocated_mb"] = torch.mps.current_allocated_memory() / 1024**2
+            stats["gpu_reserved_mb"] = torch.mps.driver_allocated_memory() / 1024**2
+
         # CPU memory
         process = psutil.Process()
         memory_info = process.memory_info()
         stats["cpu_rss_mb"] = memory_info.rss / 1024**2
         stats["cpu_vms_mb"] = memory_info.vms / 1024**2
-        
+
         return stats
     
     def _get_peak_memory(self) -> Dict[str, float]:
         """Get peak memory usage."""
         stats = {}
-        
-        if torch.cuda.is_available():
+
+        if self._is_cuda():
             stats["gpu_peak_mb"] = torch.cuda.max_memory_allocated() / 1024**2
-        
+        elif self._is_mps():
+            stats["gpu_peak_mb"] = torch.mps.current_allocated_memory() / 1024**2
+
         return stats
+
+    def _clear_cache(self) -> None:
+        """Clear device cache if applicable."""
+        if self._is_cuda():
+            torch.cuda.empty_cache()
+        elif self._is_mps():
+            torch.mps.empty_cache()
+
+    def _is_cuda(self) -> bool:
+        return self.device.type == "cuda"
+
+    def _is_mps(self) -> bool:
+        return self.device.type == "mps"
     
     def _analyze_memory_stats(self, memory_stats: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Analyze memory statistics across runs."""
@@ -450,7 +484,8 @@ def benchmark_globe_model(
     sequence_lengths: List[int] = [128, 512, 1024],
     num_warmup_runs: int = 5,
     num_benchmark_runs: int = 20,
-    precision: str = "fp16",
+    device: Optional[torch.device] = None,
+    precision: str = "bf16",
     measure_memory: bool = True,
     measure_cache_stats: bool = True,
 ) -> Dict[str, Any]:
@@ -464,6 +499,7 @@ def benchmark_globe_model(
         sequence_lengths: Sequence lengths to test
         num_warmup_runs: Number of warmup runs
         num_benchmark_runs: Number of benchmark runs
+        device: Device for benchmarking
         precision: Precision for benchmarking
         measure_memory: Whether to measure memory usage
         measure_cache_stats: Whether to measure cache statistics
@@ -480,6 +516,6 @@ def benchmark_globe_model(
         measure_cache_stats=measure_cache_stats,
         output_dir=output_dir,
     )
-    
-    benchmark = LatencyBenchmark(precision=precision)
+
+    benchmark = LatencyBenchmark(device=device, precision=precision)
     return benchmark.benchmark_model(model, tokenizer, config)
