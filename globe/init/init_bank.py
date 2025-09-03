@@ -1,395 +1,196 @@
-"""Bank initialization utilities for GloBE.
+"""Global basis bank initialization following the documented workflow.
 
-This module provides methods for initializing global basis banks using
-dictionary learning, SVD decomposition, and optimization-based approaches.
+This module implements the training recipe outlined in
+``globe_bank_initialization_training_workflow.md``.  The main entry
+point is :func:`initialize_banks` which performs:
+
+1. Per-family Z-score normalization of expert weights.
+2. Truncated SVD warm start producing per-expert factors ``A_i`` and
+   ``B_i``.
+3. Initial bank creation from ``B_i`` centroids with non-negative least
+   squares for the first set of codes ``alpha_i``.
+4. Alternating minimization consisting of a coding step (entmax),
+   dictionary update (MOD), adapter refit (OLS) and temperature
+   annealing to target a median support size.
+
+The resulting bank atoms, expert codes and adapter matrices are
+returned alongside normalization statistics and simple metrics.
 """
 
-from typing import Dict, List, Tuple, Optional, Union
-import torch
-import torch.nn.functional as F
-from torch import Tensor
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+import math
+
 import numpy as np
-from sklearn.decomposition import DictionaryLearning, TruncatedSVD
-from sklearn.linear_model import Lasso
+import torch
+from torch import Tensor
+import torch.nn.functional as F
+
+from sklearn.cluster import KMeans
 from scipy.optimize import nnls
-import warnings
+
+try:  # entmax may not be available in minimal environments
+    from entmax import entmax15
+except Exception:  # pragma: no cover - fallback
+    entmax15 = None
+
+from .zscore import normalize_expert_families, ZScoreNormalizer
+
+
+@dataclass
+class InitConfig:
+    """Configuration for bank initialization."""
+
+    rank: int
+    num_bases: int
+    steps: int = 25
+    temperature: float = 1.0
+    target_support: int = 12
+    eta: float = 0.05
+    epsilon: float = 1e-6
+    device: Optional[torch.device] = None
+    dtype: torch.dtype = torch.float32
 
 
 class BankInitializer:
-    """Utilities for initializing global basis banks."""
-    
-    def __init__(
-        self,
-        device: Optional[torch.device] = None,
-        dtype: torch.dtype = torch.float32,
-        seed: int = 42,
-    ):
-        """Initialize bank initializer.
-        
+    """High level interface for learning global basis banks."""
+
+    def __init__(self, cfg: InitConfig):
+        self.cfg = cfg
+        self.device = cfg.device or (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        self.dtype = cfg.dtype
+
+    # ------------------------------------------------------------------
+    def _warm_start(self, weights: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """Truncated SVD per expert.
+
         Args:
-            device: Device for computations
-            dtype: Data type for computations
-            seed: Random seed
-        """
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = dtype
-        self.seed = seed
-        
-        # Set random seeds
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-    
-    def init_banks_svd(
-        self,
-        expert_weights: Dict[str, List[Tensor]],
-        num_bases: int,
-        rank: int,
-    ) -> Tuple[Tensor, Dict[str, Tensor], Dict[str, Tensor]]:
-        """Initialize banks using SVD decomposition.
-        
-        Args:
-            expert_weights: Dictionary mapping family ("up", "gate") to list of expert weights
-            num_bases: Number of basis vectors to create
-            rank: Rank of basis vectors
-            
+            weights: ``E × p × d`` tensor of expert weights.
+
         Returns:
-            Tuple of (basis_bank, mixture_coefficients, adapter_matrices)
+            ``A0`` (``E × p × r``), ``B0`` (``E × r × d``), ``energy`` (``E``)
+            where ``r`` is ``cfg.rank``.
         """
-        results = {}
-        
-        for family, weights_list in expert_weights.items():
-            if not weights_list:
+
+        r = self.cfg.rank
+        A_list: List[Tensor] = []
+        B_list: List[Tensor] = []
+        energy: List[float] = []
+        for W in weights:
+            U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+            energy.append(float((S[:r] ** 2).sum() / (S ** 2).sum()))
+            A_list.append(U[:, :r] * S[:r])  # p × r
+            B_list.append(Vh[:r, :])  # r × d
+        return (
+            torch.stack(A_list, dim=0),
+            torch.stack(B_list, dim=0),
+            torch.tensor(energy, device=self.device, dtype=self.dtype),
+        )
+
+    # ------------------------------------------------------------------
+    def _initial_bank(self, B0: Tensor) -> Tuple[Tensor, Tensor]:
+        """Build initial bank from centroids and NNLS codes."""
+
+        E, r, d = B0.shape
+        flat = B0.view(E, -1).cpu().numpy()
+        kmeans = KMeans(n_clusters=self.cfg.num_bases, n_init=10).fit(flat)
+        bank = (
+            torch.from_numpy(kmeans.cluster_centers_)
+            .to(self.device, self.dtype)
+            .view(self.cfg.num_bases, r, d)
+        )
+        bank_flat = bank.view(self.cfg.num_bases, -1).T.cpu().numpy()
+        codes = []
+        for i in range(E):
+            coeffs, _ = nnls(bank_flat, flat[i])
+            codes.append(coeffs)
+        alpha0 = torch.tensor(codes, device=self.device, dtype=self.dtype)
+        return bank, alpha0
+
+    # ------------------------------------------------------------------
+    def _alternating_minimization(
+        self, W: Tensor, B_targets: Tensor, bank: Tensor, alpha0: Tensor, A0: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Dict[str, float]]:
+        """Run alternating minimization loop."""
+
+        cfg = self.cfg
+        alpha_logits = alpha0.clamp_min(cfg.epsilon).log()
+        bank = bank.clone()
+        A = A0.clone()
+        T = cfg.temperature
+        metrics = {"loss": []}
+
+        for _ in range(cfg.steps):
+            # Coding step --------------------------------------------------
+            if entmax15 is not None:
+                alpha = entmax15(alpha_logits / T, dim=-1)
+            else:  # pragma: no cover - fallback to softmax
+                alpha = F.softmax(alpha_logits / T, dim=-1)
+            alpha = torch.where(alpha > cfg.epsilon, alpha, torch.zeros_like(alpha))
+
+            # Dictionary step (MOD) ---------------------------------------
+            X = B_targets.view(B_targets.shape[0], -1).T  # RD × E
+            A_mat = alpha.T  # m × E
+            AtA = A_mat @ A_mat.T
+            reg = cfg.epsilon * torch.eye(AtA.shape[0], device=self.device, dtype=self.dtype)
+            B_flat = X @ A_mat.T @ torch.linalg.inv(AtA + reg)  # RD × m
+            bank = B_flat.T.view(cfg.num_bases, cfg.rank, B_targets.shape[-1])
+            norms = bank.view(cfg.num_bases, -1).norm(dim=-1, keepdim=True).clamp_min(cfg.epsilon)
+            bank = bank / norms.view(cfg.num_bases, 1, 1)
+            alpha = alpha * norms.squeeze(-1)
+
+            # Adapter refit -----------------------------------------------
+            mixed = torch.einsum("em,mrd->erd", alpha, bank)
+            new_A = []
+            for i in range(W.shape[0]):
+                Bi = mixed[i]
+                pinv = torch.linalg.pinv(Bi)
+                new_A.append(W[i] @ pinv)
+            A = torch.stack(new_A, dim=0)
+
+            # Reconstruction loss ----------------------------------------
+            recon = torch.einsum("epr,erd->epd", A, mixed)
+            loss = F.mse_loss(recon, W)
+            metrics["loss"].append(float(loss.detach()))
+
+            # Temperature annealing --------------------------------------
+            support = (alpha > cfg.epsilon).sum(dim=-1).float()
+            med = support.median().item()
+            T = T * math.exp(cfg.eta * (med / cfg.target_support - 1.0))
+
+        metrics["median_support"] = med
+        metrics["final_temperature"] = T
+        return bank, alpha, A, metrics
+
+    # ------------------------------------------------------------------
+    def initialize(self, expert_weights: Dict[str, List[Tensor]]):
+        """Execute the full initialization workflow."""
+
+        normalized, normalizer = normalize_expert_families(expert_weights)
+        results: Dict[str, Dict[str, Tensor]] = {}
+        all_metrics: Dict[str, Dict[str, float]] = {}
+
+        for family, weights in normalized.items():
+            if not weights:
                 continue
-            
-            # Stack expert weights: num_experts × (p × d) -> num_experts × p × d
-            stacked_weights = torch.stack(weights_list, dim=0)  # E × p × d
-            num_experts, p, d = stacked_weights.shape
-            
-            # Reshape for matrix decomposition: (E*p) × d
-            reshaped_weights = stacked_weights.view(-1, d)
-            
-            # Perform SVD on the concatenated weight matrix
-            U, S, Vt = torch.svd(reshaped_weights)
-            
-            # Extract top-r components for basis bank
-            # Basis bank: rank × d (transposed for consistency)
-            basis_bank = Vt[:rank, :].T  # d × rank
-            
-            # For each expert, find best approximation using the basis
-            mixture_coeffs = []
-            adapter_matrices = []
-            
-            for i, expert_weight in enumerate(weights_list):
-                # expert_weight: p × d
-                # Find coefficients: solve expert_weight ≈ A_i @ φ(α_i @ B)
-                
-                # For SVD init, we use linear projection onto basis
-                # Project expert weight onto basis space
-                projected = torch.matmul(expert_weight, basis_bank)  # p × rank
-                
-                # Simple initialization: uniform mixture, identity-like adapter
-                mixture_coeff = torch.ones(num_bases, device=self.device, dtype=self.dtype) / num_bases
-                adapter_matrix = projected  # p × rank
-                
-                mixture_coeffs.append(mixture_coeff)
-                adapter_matrices.append(adapter_matrix)
-            
-            results[family] = {
-                "basis_bank": basis_bank,
-                "mixture_coeffs": torch.stack(mixture_coeffs, dim=0),
-                "adapter_matrices": torch.stack(adapter_matrices, dim=0),
-            }
-        
-        return results
-    
-    def init_banks_dictionary_learning(
-        self,
-        expert_weights: Dict[str, List[Tensor]],
-        num_bases: int,
-        rank: int,
-        alpha: float = 1.0,
-        max_iter: int = 1000,
-    ) -> Dict[str, Dict[str, Tensor]]:
-        """Initialize banks using dictionary learning.
-        
-        Args:
-            expert_weights: Dictionary mapping family to list of expert weights
-            num_bases: Number of basis vectors (dictionary atoms)
-            rank: Rank of basis vectors
-            alpha: Sparsity regularization strength
-            max_iter: Maximum iterations for dictionary learning
-            
-        Returns:
-            Dictionary with initialized parameters per family
-        """
-        results = {}
-        
-        for family, weights_list in expert_weights.items():
-            if not weights_list:
-                continue
-            
-            # Stack and reshape expert weights
-            stacked_weights = torch.stack(weights_list, dim=0)  # E × p × d
-            num_experts, p, d = stacked_weights.shape
-            
-            # Convert to numpy for sklearn
-            X = stacked_weights.view(-1, d).cpu().numpy()  # (E*p) × d
-            
-            # Apply dictionary learning
-            dict_learner = DictionaryLearning(
-                n_components=num_bases,
-                alpha=alpha,
-                max_iter=max_iter,
-                random_state=self.seed,
-                positive_dict=False,
-                positive_code=False,
-            )
-            
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                sparse_codes = dict_learner.fit_transform(X)  # (E*p) × num_bases
-                dictionary = dict_learner.components_  # num_bases × d
-            
-            # Convert back to torch tensors
-            dictionary_tensor = torch.from_numpy(dictionary).to(
-                device=self.device, dtype=self.dtype
-            ).T  # d × num_bases
-            
-            sparse_codes_tensor = torch.from_numpy(sparse_codes).to(
-                device=self.device, dtype=self.dtype
-            )  # (E*p) × num_bases
-            
-            # Reshape sparse codes back to expert format
-            sparse_codes_reshaped = sparse_codes_tensor.view(num_experts, p, num_bases)
-            
-            # Initialize mixture coefficients and adapters for each expert
-            mixture_coeffs = []
-            adapter_matrices = []
-            
-            for i in range(num_experts):
-                # Average sparse codes across the intermediate dimension to get mixture
-                mixture_coeff = torch.mean(sparse_codes_reshaped[i], dim=0)  # num_bases
-                mixture_coeff = F.softmax(mixture_coeff, dim=0)  # Normalize
-                
-                # Use sparse codes as initialization for adapter
-                # Reduce dimensionality if needed
-                codes = sparse_codes_reshaped[i]  # p × num_bases
-                if rank < num_bases:
-                    # Use SVD to reduce dimensionality
-                    U, S, Vt = torch.svd(codes)
-                    adapter_matrix = U[:, :rank] * S[:rank].unsqueeze(0)  # p × rank
-                else:
-                    adapter_matrix = codes  # p × num_bases
-                
-                mixture_coeffs.append(mixture_coeff)
-                adapter_matrices.append(adapter_matrix)
-            
-            results[family] = {
-                "basis_bank": dictionary_tensor,
-                "mixture_coeffs": torch.stack(mixture_coeffs, dim=0),
-                "adapter_matrices": torch.stack(adapter_matrices, dim=0),
-            }
-        
-        return results
-    
-    def optimize_mixture_coefficients(
-        self,
-        expert_weights: List[Tensor],
-        basis_bank: Tensor,
-        adapter_matrices: Tensor,
-        method: str = "nnls",
-        l1_reg: float = 1e-4,
-    ) -> Tensor:
-        """Optimize mixture coefficients given basis bank and adapters.
-        
-        Args:
-            expert_weights: List of expert weight tensors
-            basis_bank: Basis bank tensor (d × num_bases)
-            adapter_matrices: Adapter matrices (num_experts × p × rank)
-            method: Optimization method ("nnls", "lasso", "least_squares")
-            l1_reg: L1 regularization strength for lasso
-            
-        Returns:
-            Optimized mixture coefficients (num_experts × num_bases)
-        """
-        num_experts = len(expert_weights)
-        num_bases = basis_bank.shape[1]
-        mixture_coeffs = []
-        
-        for i, expert_weight in enumerate(expert_weights):
-            # expert_weight: p × d
-            # adapter: p × rank
-            adapter = adapter_matrices[i]
-            
-            # For each row of the expert weight, solve for mixture coefficients
-            # We want: expert_weight[j, :] ≈ adapter[j, :] @ basis_bank^T @ mixture_coeff
-            
-            # Simplified approach: solve globally
-            # Flatten expert weight and compute pseudo-target
-            target = expert_weight.flatten().cpu().numpy()  # p*d
-            
-            # Create design matrix
-            # This is a simplified version - in practice, we need to account for
-            # the nonlinear activation in the mixture path
-            design_matrix = torch.kron(
-                adapter, torch.eye(basis_bank.shape[0], device=basis_bank.device)
-            )  # (p*d) × (rank*num_bases)
-            design_matrix = design_matrix.cpu().numpy()
-            
-            if method == "nnls":
-                # Non-negative least squares
-                coeffs, _ = nnls(design_matrix, target)
-            elif method == "lasso":
-                # Lasso regression
-                lasso = Lasso(alpha=l1_reg, random_state=self.seed)
-                lasso.fit(design_matrix, target)
-                coeffs = lasso.coef_
-            else:  # least_squares
-                # Standard least squares
-                coeffs, _, _, _ = np.linalg.lstsq(design_matrix, target, rcond=None)
-            
-            # Reshape and normalize coefficients
-            coeffs = coeffs.reshape(adapter.shape[1], num_bases)  # rank × num_bases
-            coeffs = np.mean(coeffs, axis=0)  # Average over rank dimension
-            coeffs = np.maximum(coeffs, 0)  # Ensure non-negative
-            coeffs = coeffs / (np.sum(coeffs) + 1e-8)  # Normalize
-            
-            mixture_coeff = torch.from_numpy(coeffs).to(
-                device=self.device, dtype=self.dtype
-            )
-            mixture_coeffs.append(mixture_coeff)
-        
-        return torch.stack(mixture_coeffs, dim=0)
-    
-    def optimize_adapters(
-        self,
-        expert_weights: List[Tensor],
-        basis_bank: Tensor,
-        mixture_coeffs: Tensor,
-        activation_fn: callable = F.silu,
-    ) -> Tensor:
-        """Optimize adapter matrices given basis bank and mixture coefficients.
-        
-        Args:
-            expert_weights: List of expert weight tensors
-            basis_bank: Basis bank tensor (d × num_bases)  
-            mixture_coeffs: Mixture coefficients (num_experts × num_bases)
-            activation_fn: Activation function used in mixture path
-            
-        Returns:
-            Optimized adapter matrices (num_experts × p × rank)
-        """
-        num_experts = len(expert_weights)
-        adapter_matrices = []
-        
-        for i, expert_weight in enumerate(expert_weights):
-            # expert_weight: p × d
-            # mixture_coeff: num_bases
-            
-            # Compute mixed basis: φ(mixture_coeff @ basis_bank^T)
-            mixed_basis = torch.matmul(mixture_coeffs[i], basis_bank.T)  # d
-            mixed_basis = activation_fn(mixed_basis)  # d
-            
-            # Solve for adapter: expert_weight ≈ adapter @ mixed_basis^T
-            # adapter: p × 1 (rank=1 case)
-            # For general rank, we need to be more careful
-            
-            # Simplified approach: use pseudo-inverse
-            if mixed_basis.dim() == 1:
-                mixed_basis = mixed_basis.unsqueeze(0)  # 1 × d
-            
-            # Solve: expert_weight ≈ adapter @ mixed_basis
-            adapter = torch.linalg.lstsq(
-                mixed_basis.T.unsqueeze(0).expand(expert_weight.shape[0], -1, -1),
-                expert_weight.unsqueeze(-1)
-            ).solution.squeeze(-1)  # p × d
-            
-            # For now, assume rank=1 and take mean
-            adapter = adapter.mean(dim=1, keepdim=True)  # p × 1
-            
-            adapter_matrices.append(adapter)
-        
-        return torch.stack(adapter_matrices, dim=0)
-    
-    def joint_optimization(
-        self,
-        expert_weights: Dict[str, List[Tensor]],
-        num_bases: int,
-        rank: int,
-        num_iterations: int = 100,
-        lr: float = 1e-3,
-    ) -> Dict[str, Dict[str, Tensor]]:
-        """Joint optimization of all parameters.
-        
-        Args:
-            expert_weights: Dictionary mapping family to expert weights
-            num_bases: Number of basis vectors
-            rank: Rank of basis vectors
-            num_iterations: Number of optimization iterations
-            lr: Learning rate
-            
-        Returns:
-            Dictionary with optimized parameters per family
-        """
-        results = {}
-        
-        for family, weights_list in expert_weights.items():
-            if not weights_list:
-                continue
-            
-            num_experts = len(weights_list)
-            p, d = weights_list[0].shape
-            
-            # Initialize parameters
-            basis_bank = torch.randn(d, num_bases, device=self.device, dtype=self.dtype) * 0.02
-            mixture_logits = torch.randn(num_experts, num_bases, device=self.device, dtype=self.dtype) * 0.01
-            adapter_matrices = torch.randn(num_experts, p, rank, device=self.device, dtype=self.dtype) * 0.02
-            
-            # Make parameters learnable
-            basis_bank.requires_grad_(True)
-            mixture_logits.requires_grad_(True)
-            adapter_matrices.requires_grad_(True)
-            
-            optimizer = torch.optim.Adam([basis_bank, mixture_logits, adapter_matrices], lr=lr)
-            
-            target_weights = torch.stack(weights_list, dim=0).to(device=self.device, dtype=self.dtype)
-            
-            for iteration in range(num_iterations):
-                optimizer.zero_grad()
-                
-                # Forward pass
-                mixture_weights = F.softmax(mixture_logits, dim=-1)  # num_experts × num_bases
-                
-                # Compute mixed bases for each expert
-                mixed_bases = torch.matmul(mixture_weights, basis_bank.T)  # num_experts × d
-                mixed_bases = F.silu(mixed_bases)  # Apply activation
-                
-                # Compute reconstructed weights
-                # For each expert: adapter @ mixed_basis^T
-                reconstructed = torch.bmm(
-                    adapter_matrices,  # num_experts × p × rank
-                    mixed_bases.unsqueeze(-1)  # num_experts × d × 1
-                ).squeeze(-1)  # num_experts × p
-                
-                # Reconstruction loss
-                loss = F.mse_loss(reconstructed, target_weights.view(num_experts, -1))
-                
-                # Add regularization
-                l1_loss = 1e-4 * torch.mean(torch.abs(mixture_weights))
-                spectral_loss = 1e-4 * torch.norm(basis_bank, p=2)
-                
-                total_loss = loss + l1_loss + spectral_loss
-                
-                total_loss.backward()
-                optimizer.step()
-                
-                if iteration % 20 == 0:
-                    print(f"Family {family}, Iteration {iteration}: Loss = {total_loss.item():.6f}")
-            
-            results[family] = {
-                "basis_bank": basis_bank.detach(),
-                "mixture_coeffs": F.softmax(mixture_logits.detach(), dim=-1),
-                "adapter_matrices": adapter_matrices.detach(),
-            }
-        
-        return results
+            W = torch.stack(weights).to(self.device, self.dtype)
+            A0, B0, energy = self._warm_start(W)
+            bank, alpha0 = self._initial_bank(B0)
+            bank, alpha, A, metrics = self._alternating_minimization(W, B0, bank, alpha0, A0)
+            metrics["energy_captured_mean"] = float(energy.mean())
+            results[family] = {"bank": bank, "codes": alpha, "adapters": A}
+            all_metrics[family] = metrics
+
+        return {"results": results, "normalizer": normalizer, "metrics": all_metrics}
+
+
+def initialize_banks(
+    expert_weights: Dict[str, List[Tensor]], cfg: InitConfig
+) -> Tuple[Dict[str, Dict[str, Tensor]], ZScoreNormalizer, Dict[str, Dict[str, float]]]:
+    """Convenience function wrapping :class:`BankInitializer`."""
+
+    initializer = BankInitializer(cfg)
+    out = initializer.initialize(expert_weights)
+    return out["results"], out["normalizer"], out["metrics"]
