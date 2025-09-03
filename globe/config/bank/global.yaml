@@ -4,17 +4,22 @@ bank:
   m_up: 128    # number of basis vectors for Up projection
   m_gate: 128  # number of basis vectors for Gate projection
   
-  # Rank configuration
-  r: null  # rank of basis (set to p by default, or p/2 for ablation)
+  # Rank configuration  
+  r: null  # rank of basis (if null, will be set based on expert dimensions)
   
   # Activation function in mixture path
   activation:
     type: "silu"  # or "tanh"
   
-  # Initialization
+  # Initialization parameters
   init:
-    method: "svd"  # or "dict" for dictionary learning
+    method: "svd"  # warm start method
     seed: 42
+    steps: 25  # alternating minimization steps
+    temperature: 1.0  # initial temperature for entmax
+    target_support: 12  # target median support size
+    eta: 0.05  # temperature annealing rate
+    epsilon: 1.0e-6  # numerical stability constant
     
   # Regularization
   spectral_reg: 0.0  # spectral regularization on banks

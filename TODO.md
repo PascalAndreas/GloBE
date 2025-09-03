@@ -58,13 +58,39 @@
   - Forward pass combines shared expert output with routed expert output
   - Cache and precomposition logic should skip shared experts
 
-### 8. Bank Initialization Overhaul ✅
-Implemented the full initialization workflow in `globe/init/init_bank.py`
-and `globe/init/zscore.py` following
-`globe_bank_initialization_training_workflow.md`. The new pipeline adds
-per-family Z-score normalization, truncated SVD warm starts, centroids-
-based bank seeding with NNLS codes, an alternating minimization loop,
-temperature annealing, and metric tracking.
+### 8. Bank Initialization Iteration
+- **Status**: Base implementation merged, needs iteration for stability and performance
+- **Current state**: Basic workflow implemented in `globe/init/init_bank.py` and `globe/init/zscore.py`
+- **Architecture refactor needed**:
+  - **Split responsibilities**: 
+    - `init_bank.py` should provide low-level PyTorch building blocks (SVD, single AM iteration)
+    - `fit_banks.py` should handle full training orchestration, config, and logging
+    - Remove Hydra dependencies from core modules for better testability
+  - **PyTorch-native alternating optimization**: Replace sklearn/scipy dependencies with pure PyTorch
+    - Use gradient-based optimization with Adam/AdamW for stable convergence
+    - Implement batched operations for parallel expert processing
+    - Enable full GPU/MPS acceleration without CPU transfers
+  - **Normalization folding strategy**: Handle mean bias term properly
+    - Keep Z-score variance for convergence stability (as shown in MoBE paper)
+    - Investigate if mean term can be dropped (MoBE found it negligible)
+    - Ensure theoretical assumption that weight matrices have ~zero mean
+  - **Convergence stability**: Address alternating optimization instabilities noted in MoBE paper
+    - Experiment with optimizer tricks (learning rate scheduling, gradient clipping)
+    - Add loss function modifications for stable training
+    - Implement early stopping and convergence monitoring
+  - **Bank architecture options**: Support both approaches
+    - Unified bank for Gate+Up (shared dictionary atoms)
+    - Separate banks for Gate and Up (independent dictionaries)
+    - Config flag to switch between approaches
+  - **WandB integration requirements**:
+    - Log reconstruction loss curves for each family
+    - Track sparsity metrics (support sizes, temperature evolution)
+    - Monitor gradient norms and convergence indicators
+    - Save checkpoints of best banks based on validation loss
+    - Compare unified vs separate bank performance
+  - **Performance optimization**: 
+    - Mixed precision support (fp16/bf16)
+    - Memory-efficient batch processing for large models
 
 ## Integration Issues
 

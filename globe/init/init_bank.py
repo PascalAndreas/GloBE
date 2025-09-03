@@ -41,15 +41,23 @@ from .zscore import normalize_expert_families, ZScoreNormalizer
 class InitConfig:
     """Configuration for bank initialization."""
 
-    rank: int
-    num_bases: int
+    # Core dimensions
+    rank: int  # r - inner dimension for decomposition
+    num_bases: int  # m - number of dictionary atoms
+    
+    # Training parameters
     steps: int = 25
     temperature: float = 1.0
     target_support: int = 12
-    eta: float = 0.05
+    eta: float = 0.05  # temperature annealing rate
     epsilon: float = 1e-6
+    
+    # Device and precision
     device: Optional[torch.device] = None
     dtype: torch.dtype = torch.float32
+    
+    # Note: Removed from_hydra_config - config handling should be in scripts
+    # This keeps the module pure and testable
 
 
 class BankInitializer:
@@ -194,3 +202,7 @@ def initialize_banks(
     initializer = BankInitializer(cfg)
     out = initializer.initialize(expert_weights)
     return out["results"], out["normalizer"], out["metrics"]
+
+
+# Note: Removed initialize_banks_from_config - this orchestration belongs in fit_banks.py
+# Keep this module focused on core bank initialization algorithms
