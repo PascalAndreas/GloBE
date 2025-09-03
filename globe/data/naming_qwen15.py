@@ -7,6 +7,9 @@ and GloBE internal representations for Qwen1.5-MoE models.
 from typing import Dict, List, Tuple, Optional
 import re
 
+import torch
+from transformers import AutoModelForCausalLM
+
 
 class Qwen15MoETensorNaming:
     """Tensor naming patterns for Qwen1.5-MoE models."""
@@ -114,3 +117,29 @@ class Qwen15MoETensorNaming:
                 families["down"].append((name, parsed))
                 
         return families
+
+
+def extract_expert_weights(model_name_or_path: str) -> Dict[str, List[torch.Tensor]]:
+    """Load a HuggingFace model and extract expert weights grouped by family.
+
+    The implementation is intentionally lightweight and relies only on the
+    naming patterns defined above.  Only ``up`` and ``gate`` projections are
+    returned as those are the ones used for bank training.
+    """
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path, trust_remote_code=True
+    )
+    naming = Qwen15MoETensorNaming()
+
+    families: Dict[str, List[torch.Tensor]] = {"up": [], "gate": []}
+    for name, param in model.named_parameters():
+        info = naming.parse_tensor_name(name)
+        if info is None:
+            continue
+        ttype = info["type"]
+        if "up" in ttype:
+            families["up"].append(param.detach().to("cpu"))
+        elif "gate" in ttype:
+            families["gate"].append(param.detach().to("cpu"))
+    return families
