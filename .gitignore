@@ -1,0 +1,11 @@
+/globe_env/
+/test_output/
+/wandb/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+.pytest_cache/

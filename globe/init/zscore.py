@@ -30,16 +30,29 @@ class ZScoreNormalizer:
 
     # ------------------------------------------------------------------
     def fit(self, expert_weights: Dict[str, List[Tensor]]) -> None:
-        """Collect per-position statistics across experts for each family."""
+        """Collect layerwise statistics across all experts for each family.
+        
+        Following MoBE paper: compute mean/std across all expert weights in the family,
+        not per-position. This gives scalar mean and std per family.
+        """
 
         self.stats = {}
         for family, weights in expert_weights.items():
             if not weights:
                 continue
             stacked = torch.stack(weights, dim=0)  # E × p × d
-            mean = stacked.mean(dim=0)
-            std = stacked.std(dim=0).clamp_min(self.eps)
-            self.stats[family] = ZScoreStats(mean=mean, std=std)
+            
+            # MoBE paper approach: compute scalar statistics across all weights
+            # This treats the entire weight matrix collection as a single distribution
+            all_weights = stacked.view(-1)  # Flatten all expert weights
+            mean = all_weights.mean()  # Scalar mean
+            std = all_weights.std().clamp_min(self.eps)  # Scalar std
+            
+            # Convert to same shape as original for broadcasting compatibility
+            mean_expanded = torch.full_like(stacked[0], mean)
+            std_expanded = torch.full_like(stacked[0], std)
+            
+            self.stats[family] = ZScoreStats(mean=mean_expanded, std=std_expanded)
 
     # ------------------------------------------------------------------
     def transform(self, expert_weights: Dict[str, List[Tensor]]) -> Dict[str, List[Tensor]]:

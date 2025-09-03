@@ -1,0 +1,9 @@
+# Minimal requirements for testing GloBE bank training
+torch>=2.0.0
+transformers>=4.35.0
+safetensors
+numpy
+entmax  # Optional but recommended for sparse attention
+wandb   # Optional for logging
+omegaconf  # For config management
+hydra-core  # For config management

@@ -22,6 +22,7 @@ class GloBEBank(nn.Module):
         self,
         num_bases: int,
         rank: int,
+        hidden_dim: int,
         activation: str = "silu",
         init_method: str = "xavier_uniform",
         orthogonal_reg: float = 0.0,
@@ -32,6 +33,7 @@ class GloBEBank(nn.Module):
         Args:
             num_bases: Number of basis vectors (m)
             rank: Rank/dimension of each basis vector (r)
+            hidden_dim: Hidden dimension (d)
             activation: Activation function ("silu", "tanh", "relu", "gelu")
             init_method: Initialization method for basis vectors
             orthogonal_reg: Orthogonality regularization strength
@@ -41,11 +43,12 @@ class GloBEBank(nn.Module):
         
         self.num_bases = num_bases
         self.rank = rank
+        self.hidden_dim = hidden_dim
         self.orthogonal_reg = orthogonal_reg
         self.spectral_reg = spectral_reg
         
-        # Basis bank B ∈ R^{m×r}
-        self.bases = nn.Parameter(torch.empty(num_bases, rank))
+        # Basis bank B ∈ R^{m×r×d} - each basis is a r×d matrix
+        self.bases = nn.Parameter(torch.empty(num_bases, rank, hidden_dim))
         
         # Activation function
         if activation == "silu":
@@ -81,10 +84,11 @@ class GloBEBank(nn.Module):
             mixture_weights: Mixture weights α ∈ R^{batch×m}
             
         Returns:
-            Mixed basis vectors φ(Σ_j α_j B_j) ∈ R^{batch×r}
+            Mixed basis matrices φ(Σ_j α_j B_j) ∈ R^{batch×r×d}
         """
-        # Linear combination: batch×m @ m×r -> batch×r
-        mixed_bases = torch.matmul(mixture_weights, self.bases)
+        # Linear combination: batch×m @ m×r×d -> batch×r×d
+        # Using einsum for clarity: batch×m, m×r×d -> batch×r×d
+        mixed_bases = torch.einsum('bm,mrd->brd', mixture_weights, self.bases)
         
         # Apply activation
         return self.activation(mixed_bases)
@@ -160,6 +164,7 @@ class DualGloBEBank(nn.Module):
         num_bases_up: int,
         num_bases_gate: int,
         rank: int,
+        hidden_dim: int,
         activation: str = "silu",
         **bank_kwargs,
     ):
@@ -169,16 +174,17 @@ class DualGloBEBank(nn.Module):
             num_bases_up: Number of basis vectors for Up projection
             num_bases_gate: Number of basis vectors for Gate projection  
             rank: Rank/dimension of basis vectors
+            hidden_dim: Hidden dimension
             activation: Activation function
             **bank_kwargs: Additional arguments for GloBEBank
         """
         super().__init__()
         
         self.up_bank = GloBEBank(
-            num_bases_up, rank, activation, **bank_kwargs
+            num_bases_up, rank, hidden_dim, activation, **bank_kwargs
         )
         self.gate_bank = GloBEBank(
-            num_bases_gate, rank, activation, **bank_kwargs
+            num_bases_gate, rank, hidden_dim, activation, **bank_kwargs
         )
     
     def forward(
