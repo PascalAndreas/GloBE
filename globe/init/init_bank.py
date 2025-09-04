@@ -112,20 +112,36 @@ def create_warm_start(weights: Tensor, rank: int, seeding_config: Optional[Seedi
         W_i = weights[i]  # p × d
         B_i = B0[i]      # r × d
         
-        # Solve A_i such that W_i ≈ A_i @ B_i
+        # Solve A_i such that W_i ≈ A_i @ B_i using more stable approach
         # W_i: p × d, B_i: r × d, we want A_i: p × r
-        # A_i = W_i @ B_i^+ where B_i^+ is pseudoinverse
+        # Use normal equations: A_i = W_i @ B_i^T @ (B_i @ B_i^T + λI)^{-1}
         if device.type == "mps":
-            # Move to CPU for pseudoinverse
+            # Move to CPU for matrix operations
             B_i_cpu = B_i.cpu().float()  # r × d
             W_i_cpu = W_i.cpu().float()  # p × d
-            B_i_pinv = torch.linalg.pinv(B_i_cpu)  # r × d -> d × r
-            A_i = (W_i_cpu @ B_i_pinv).to(device, original_dtype)  # p × d @ d × r = p × r
+            
+            # Normal equations approach for better conditioning
+            G = B_i_cpu @ B_i_cpu.T + 1e-6 * torch.eye(B_i_cpu.shape[0])  # r × r
+            R = W_i_cpu @ B_i_cpu.T  # p × r
+            try:
+                L = torch.linalg.cholesky(G)
+                A_i = torch.cholesky_solve(R.T, L).T.to(device, original_dtype)
+            except RuntimeError:
+                # Fallback to general solve if Cholesky fails
+                A_i = torch.linalg.solve(G, R.T).T.to(device, original_dtype)
         else:
             B_i_f32 = B_i.float()  # r × d
             W_i_f32 = W_i.float()  # p × d
-            B_i_pinv = torch.linalg.pinv(B_i_f32)  # r × d -> d × r
-            A_i = (W_i_f32 @ B_i_pinv).to(original_dtype)  # p × d @ d × r = p × r
+            
+            # Normal equations approach for better conditioning
+            G = B_i_f32 @ B_i_f32.T + 1e-6 * torch.eye(B_i_f32.shape[0], device=device)  # r × r
+            R = W_i_f32 @ B_i_f32.T  # p × r
+            try:
+                L = torch.linalg.cholesky(G)
+                A_i = torch.cholesky_solve(R.T, L).T.to(original_dtype)
+            except RuntimeError:
+                # Fallback to general solve if Cholesky fails
+                A_i = torch.linalg.solve(G, R.T).T.to(original_dtype)
         
         A_list.append(A_i)
         
@@ -237,7 +253,6 @@ def am_step(
     cfg: InitConfig,
     step: int = 0,
     log_metrics: bool = False,
-    log_frequency: int = 1,  # Log every N steps
 ) -> Tuple[Tensor, Tensor, float, float, float, Dict[str, float]]:
     """Perform a single alternating minimization iteration.
 
@@ -374,7 +389,7 @@ def am_step(
 
     # Collect comprehensive metrics (only when needed)
     metrics = {}
-    if log_metrics and (step % log_frequency == 0):
+    if log_metrics:
         # A. Global reconstruction (weight space) - Proper relative Frobenius error
         recon_mse = loss.item()
         # Compute relative Frobenius error: ||recon - W||_F / ||W||_F
@@ -474,7 +489,7 @@ def initialize_banks(
         T = cfg.temperature
         loss = 0.0
         for step in range(cfg.steps):
-            alpha, A, loss, T, _, _ = am_step(W, B0, bank_module, alpha, A, T, cfg, step=step, log_metrics=False, log_frequency=1)
+            alpha, A, loss, T, _, _ = am_step(W, B0, bank_module, alpha, A, T, cfg, step=step, log_metrics=False)
         results[family] = {"bank": bank_module.bases.detach(), "codes": alpha, "adapters": A}
         
         # Combine metrics

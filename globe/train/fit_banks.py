@@ -78,6 +78,11 @@ class AlternatingBankTrainer:
         target_support: int = 12,
         activation: str = "silu",
         log_wandb: bool = True,
+        # Conservative hyperparameters
+        min_temperature: float = 0.5,
+        lambda_A: float = 1e-6,
+        lambda_B: float = 1e-4,
+        epsilon: float = 1e-4,
     ) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Optional[ZScoreNormalizer]]:
         """Train banks for the provided expert weight families.
         
@@ -97,22 +102,9 @@ class AlternatingBankTrainer:
         
         if self.normalize_experts:
             working_weights, normalizer = normalize_expert_families(expert_weights)
-            if log_wandb and wandb.run is not None:
-                # Log normalization stats with explicit step to avoid conflicts
-                zscore_metrics = {}
-                for family in working_weights.keys():
-                    if family in normalizer.stats:
-                        stats = normalizer.stats[family]
-                        zscore_metrics.update({
-                            f"{family}/zscore_mean_norm": torch.norm(stats.mean).item(),
-                            f"{family}/zscore_std_mean": stats.std.mean().item(),
-                            f"{family}/zscore_std_std": stats.std.std().item(),
-                        })
-                # Log z-score stats at step -1 to avoid conflicts with AM loop steps
-                wandb.log(zscore_metrics, step=-1)
+            # Remove z-score logging to avoid step conflicts
 
         results: Dict[str, Dict[str, torch.Tensor]] = {}
-        global_step = 0  # Global step counter across all families
 
         for family, weights in working_weights.items():
             if not weights:
@@ -136,6 +128,10 @@ class AlternatingBankTrainer:
                 dtype=self.dtype,
                 target_support=target_support,
                 temperature=temperature_init,
+                min_temperature=min_temperature,
+                lambda_A=lambda_A,
+                lambda_B=lambda_B,
+                epsilon=epsilon,
                 seeding_config=self.seeding_config,
             )
 
@@ -175,15 +171,25 @@ class AlternatingBankTrainer:
                 
                 wandb.log(seeding_log)
 
+            print(f"      Training {family.upper()} family:")
             for step in range(num_steps):
+                # Simple progress bar
+                progress = (step + 1) / num_steps
+                bar_length = 30
+                filled_length = int(bar_length * progress)
+                bar = '█' * filled_length + '░' * (bar_length - filled_length)
+                print(f"\r      [{bar}] {step+1:2d}/{num_steps} steps | ", end="", flush=True)
+                
                 alpha, A, loss, T, med, metrics = am_step(
                     W, B0, bank_module, alpha, A, T, cfg, step=step, 
-                    log_metrics=log_wandb, log_frequency=3  # Log every 3 steps for speed
+                    log_metrics=log_wandb
                 )
-                current_global_step = global_step + step
+                
+                # Update progress bar with current metrics
+                print(f"Loss: {loss:.4f} | Support: {med:.1f} | T: {T:.2f}", end="", flush=True)
                 
                 if log_wandb and metrics and wandb.run is not None:
-                    # Log family-specific metrics with proper prefixes
+                    # Log family-specific metrics with proper prefixes and family-specific step counter
                     family_metrics = {}
                     for key, value in metrics.items():
                         family_metrics[f"{family}/{key}"] = value
@@ -196,10 +202,12 @@ class AlternatingBankTrainer:
                         f"{family}/step": step,
                     })
                     
-                    wandb.log(family_metrics, step=current_global_step)
-
-            # Update global step counter for next family
-            global_step += num_steps
+                    # Use family-specific step counter to avoid overlap
+                    wandb.log(family_metrics, step=step)
+            
+            # Complete the progress bar
+            print(f"\r      [{'█' * bar_length}] {num_steps:2d}/{num_steps} steps | Final - Loss: {loss:.4f} | Support: {med:.1f} | T: {T:.2f}")
+            print(f"      ✅ {family.upper()} training completed!")
             
             # alpha is already the final mixture weights (no need to convert from logits)
             final_alpha = alpha

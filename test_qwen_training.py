@@ -47,7 +47,14 @@ def train_banks_minimal_test(
     device: str = "auto",
     model_name: str = "Qwen/Qwen1.5-MoE-A2.7B",
     log_wandb: bool = False,
-    seeding_method: str = "ts_pca"
+    seeding_method: str = "ts_pca",
+    # Conservative hyperparameters
+    temperature_init: float = 1.5,
+    min_temperature: float = 1.0,
+    target_support: int = 16,
+    lambda_A: float = 1e-5,
+    lambda_B: float = 1e-4,
+    epsilon: float = 1e-4,
 ) -> Dict[str, Any]:
     """Run a minimal bank training test."""
     # Get dimensions from first expert
@@ -76,6 +83,10 @@ def train_banks_minimal_test(
     print(f"   - Seeding method: {method_info['name']}")
     print(f"   - Method description: {method_info['description']}")
     print(f"   - Speed: {method_info['speed']}, Quality: {method_info['quality']}, MPS-friendly: {method_info['mps_friendly']}")
+    print(f"   - Temperature: {temperature_init} (min: {min_temperature})")
+    print(f"   - Target support: {target_support}")
+    print(f"   - Regularization: λ_A={lambda_A}, λ_B={lambda_B}")
+    print(f"   - Epsilon: {epsilon}")
     
     # Auto-detect device
     if device == "auto":
@@ -122,15 +133,19 @@ def train_banks_minimal_test(
     
     print(f"🔄 Training banks...")
     try:
-        # Train banks
+        # Train banks with conservative hyperparameters
         results, normalizer = trainer.train(
             expert_weights,
             family_configs=family_configs,
             num_steps=num_steps,
-            temperature_init=3.0,  # Higher temperature for stability
-            target_support=12,
+            temperature_init=temperature_init,
+            target_support=target_support,
             activation="silu",
-            log_wandb=log_wandb,  # Use parameter
+            log_wandb=log_wandb,
+            min_temperature=min_temperature,
+            lambda_A=lambda_A,
+            lambda_B=lambda_B,
+            epsilon=epsilon,
         )
         
         print(f"✅ Training completed!")
@@ -175,7 +190,7 @@ def train_banks_minimal_test(
 
 
 def test_reconstruction_quality(training_output: Dict[str, Any], expert_weights: Dict[str, torch.Tensor]):
-    """Test reconstruction quality of trained banks."""
+    """Test reconstruction quality of trained banks with NaN detection."""
     print(f"\n🔍 Testing reconstruction quality...")
     
     results = training_output["results"]
@@ -192,6 +207,25 @@ def test_reconstruction_quality(training_output: Dict[str, Any], expert_weights:
         codes = results[family]['codes'].to(device)  # E × m
         adapters = results[family]['adapters'].to(device)  # E × p × r
         
+        # Debug: Check for NaN/Inf in components
+        bank_nans = torch.isnan(bank).sum().item()
+        codes_nans = torch.isnan(codes).sum().item()
+        adapters_nans = torch.isnan(adapters).sum().item()
+        
+        if bank_nans > 0 or codes_nans > 0 or adapters_nans > 0:
+            print(f"   ⚠️  NaN detected in components: bank={bank_nans}, codes={codes_nans}, adapters={adapters_nans}")
+        
+        # Check for extreme values
+        bank_max = bank.abs().max().item()
+        codes_max = codes.abs().max().item()
+        adapters_max = adapters.abs().max().item()
+        print(f"   📊 Max absolute values: bank={bank_max:.6f}, codes={codes_max:.6f}, adapters={adapters_max:.6f}")
+        
+        # Check codes sparsity
+        codes_sparsity = (codes < 1e-6).float().mean().item()
+        codes_zeros = (codes == 0).float().mean().item()
+        print(f"   📊 Codes sparsity: {codes_sparsity:.3f}, exact zeros: {codes_zeros:.3f}")
+        
         # Original weights - ensure consistent dtype with bank
         original_weights = torch.stack(expert_weights[family]).to(device, dtype=bank.dtype)  # E × p × d
         
@@ -203,18 +237,43 @@ def test_reconstruction_quality(training_output: Dict[str, Any], expert_weights:
             # Mix bases: Σ_j α_{i,j} B_j
             mixed_basis = torch.einsum('m,mrd->rd', codes[i], bank)  # r × d
             
+            # Check for NaN in mixed basis
+            if torch.isnan(mixed_basis).any():
+                print(f"   ⚠️  NaN in mixed_basis for expert {i}")
+                print(f"      codes[{i}] range: [{codes[i].min():.6f}, {codes[i].max():.6f}]")
+                print(f"      codes[{i}] sum: {codes[i].sum():.6f}")
+            
             # Apply adapter: A_i @ mixed_basis
             reconstruction = torch.matmul(adapters[i], mixed_basis)  # p × d
+            
+            # Check for NaN in reconstruction
+            if torch.isnan(reconstruction).any():
+                print(f"   ⚠️  NaN in reconstruction for expert {i}")
+                print(f"      adapter[{i}] range: [{adapters[i].min():.6f}, {adapters[i].max():.6f}]")
+            
             reconstructions.append(reconstruction)
         
         reconstructed_weights = torch.stack(reconstructions)  # E × p × d
         
-        # Compute metrics
+        # Final NaN check
+        recon_nans = torch.isnan(reconstructed_weights).sum().item()
+        if recon_nans > 0:
+            print(f"   ❌ {recon_nans} NaN values in final reconstruction!")
+            return  # Skip metrics if we have NaN
+        
+        # Compute metrics with safe division
         mse = torch.nn.functional.mse_loss(reconstructed_weights, original_weights).item()
-        relative_error = torch.norm(reconstructed_weights - original_weights) / torch.norm(original_weights)
+        
+        # Safe relative error computation
+        diff_norm = torch.norm(reconstructed_weights - original_weights)
+        orig_norm = torch.norm(original_weights)
+        if orig_norm > 0:
+            relative_error = (diff_norm / orig_norm).item()
+        else:
+            relative_error = float('inf') if diff_norm > 0 else 0.0
         
         print(f"   - MSE: {mse:.6f}")
-        print(f"   - Relative error: {relative_error.item():.6f}")
+        print(f"   - Relative error: {relative_error:.6f}")
         
         # Per-expert analysis
         per_expert_mse = torch.nn.functional.mse_loss(
@@ -310,6 +369,13 @@ def main():
     parser.add_argument("--wandb-name", default=None, help="Wandb run name")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--seeding-method", default="ts_pca", choices=["svd", "ts_pca", "left_gram_pca", "spherical_kmeans", "residual_greedy", "hybrid"], help="Seeding method for bank initialization")
+    # Conservative hyperparameters for stability
+    parser.add_argument("--temperature-init", type=float, default=1.5, help="Initial temperature (lower for stability)")
+    parser.add_argument("--min-temperature", type=float, default=1.0, help="Minimum temperature to prevent support collapse")
+    parser.add_argument("--target-support", type=int, default=16, help="Target support size (higher for stability)")
+    parser.add_argument("--lambda-A", type=float, default=1e-5, help="Adapter regularization (higher for stability)")
+    parser.add_argument("--lambda-B", type=float, default=1e-4, help="Bank regularization")
+    parser.add_argument("--epsilon", type=float, default=1e-4, help="Sparsity threshold")
     
     args = parser.parse_args()
     
@@ -328,21 +394,43 @@ def main():
     # Initialize wandb if enabled
     if not args.no_wandb:
         wandb_name = args.wandb_name or f"test-{args.steps}steps-rr{args.rank_ratio:.2f}-br{args.basis_ratio:.2f}"
-        wandb.init(
-            project=args.wandb_project,
-            name=wandb_name,
-            config={
-                "model": args.model,
-                "steps": args.steps,
-                "rank_ratio": args.rank_ratio,
-                "basis_ratio": args.basis_ratio,
-                "max_experts": args.max_experts,
-                "device": args.device,
-                "seeding_method": args.seeding_method,
-            },
-            tags=["test", "qwen", "globe"],
-        )
-        print(f"📊 Wandb logging enabled: {wandb_name}")
+        try:
+            # Try online mode first
+            wandb.init(
+                project=args.wandb_project,
+                name=wandb_name,
+                config={
+                    "model": args.model,
+                    "steps": args.steps,
+                    "rank_ratio": args.rank_ratio,
+                    "basis_ratio": args.basis_ratio,
+                    "max_experts": args.max_experts,
+                    "device": args.device,
+                    "seeding_method": args.seeding_method,
+                },
+                tags=["test", "qwen", "globe"],
+                mode="online"
+            )
+            print(f"📊 Wandb logging enabled (online): {wandb_name}")
+        except Exception as e:
+            print(f"⚠️  Online WandB failed ({e}), falling back to offline mode...")
+            wandb.init(
+                project=args.wandb_project,
+                name=wandb_name,
+                config={
+                    "model": args.model,
+                    "steps": args.steps,
+                    "rank_ratio": args.rank_ratio,
+                    "basis_ratio": args.basis_ratio,
+                    "max_experts": args.max_experts,
+                    "device": args.device,
+                    "seeding_method": args.seeding_method,
+                },
+                tags=["test", "qwen", "globe"],
+                mode="offline"
+            )
+            print(f"📊 Wandb logging enabled (offline): {wandb_name}")
+            print(f"   💡 You can sync later with: wandb sync wandb/offline-run-*")
     
     try:
         # Step 1: Extract expert weights with built-in caching and subset functionality
@@ -366,7 +454,13 @@ def main():
             device=args.device,
             model_name=args.model,
             log_wandb=not args.no_wandb,
-            seeding_method=args.seeding_method
+            seeding_method=args.seeding_method,
+            temperature_init=args.temperature_init,
+            min_temperature=args.min_temperature,
+            target_support=args.target_support,
+            lambda_A=args.lambda_A,
+            lambda_B=args.lambda_B,
+            epsilon=args.epsilon,
         )
         
         # Step 4: Test reconstruction quality
