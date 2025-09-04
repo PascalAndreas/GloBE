@@ -1,6 +1,6 @@
 # GloBE — Bank Initialization & Training Workflow
 
-Concise plan for initializing and training a **single global basis bank** (Up & Gate), with sparse, token‑independent mixtures and precomposition for inference. Includes key metrics to log.
+Implementation of **global basis banks** for MoE FFN compression using sparse mixtures and alternating minimization. This document describes the complete workflow from expert extraction to trained banks.
 
 ---
 
@@ -11,24 +11,33 @@ Concise plan for initializing and training a **single global basis bank** (Up & 
 
 ---
 
-## 2) Warm Starts
-4. **Truncated SVD (rank r)** per expert `W_i ∈ R^{p×d}`:
-   - `W_i ≈ (U_r Σ_r)(V_r^T)` ⇒ set `A_i^(0)=U_r Σ_r ∈ R^{p×r}`, `B_i^(0)=V_r^T ∈ R^{r×d}`.
+## 2) Warm Start Seeding
+4. **Configurable seeding methods** for creating proxy right factors `B_i^(0) ∈ R^{r×d}`:
+   - **TS-PCA** (default): Row-sampled Tall-Skinny PCA—fastest, MPS-friendly, no per-expert SVD
+   - **Left-Gram PCA**: Shared left subspace projection for higher-quality proxies
+   - **SVD baseline**: Original per-expert truncated SVD for comparison
+   - **Spherical k-means**: Clustering-based seeding on unit sphere
+   - **Residual greedy**: K-SVD style atom selection for lowest initial MSE
 5. **Initial bank & codes**:
-   - Build a provisional bank `{B_j}` from a few `B_i^(0)` centroids or random picks.
-   - **NNLS (optional simplex)** per expert to get initial codes `α_i^(0)` s.t. `B_i^(0) ≈ Σ_j α_{i,j} B_j`.
+   - Build provisional bank `{B_j}` from proxy centroids via k-means clustering
+   - **Least squares + clamp** to get initial codes `α_i^(0)` s.t. `B_i^(0) ≈ Σ_j α_{i,j} B_j`
+   - **OLS adapter fit**: `A_i^(0) = W_i B_i^{(0)+}` for reconstruction `W_i ≈ A_i B_i^{(0)}`
 
 ---
 
 ## 3) Bank Learning (Alternating Minimization)
-6. **Coding step** (sparse map): maintain logits `z_i`; compute `α_i = entmax(z_i / T)` (or sparsemax). Add tiny L1 if needed; **ε‑prune** very small entries.
-7. **Dictionary step (MOD)**: vectorize targets `X` (stack of `B_i^(t)`), codes `A` (stack of `α_i`), then update bank:
-   - `B ← X A^T (A A^T)^−1`, reshape to `r×d` atoms.
-   - **Normalize atoms** (e.g., unit Frobenius/row norms) and rescale codes to fix gauge.
-8. **Refit per‑expert A (OLS)**: `A_i ← argmin_A ||W_i − A · (Σ_j α_{i,j} B_j)||_F^2 = W_i · (Σ_j α_{i,j} B_j)^+`.
-9. **Temperature control**: every K steps, adjust `T` to target a median support (e.g., 12):
-   - `T ← T · exp(η · (median(|supp(α_i)|)/target − 1))`, with `η ∈ [0.02, 0.1]`.
-10. **Repeat 6–9** for S steps; early‑stop on validation MSE plateau.
+6. **Coding step**: Apply temperature scaling and sparsity to current mixture weights `α_i`:
+   - `α_i = entmax(log(α_i) / T)` for T ≠ 1.0 (entmax/sparsemax activation)
+   - **ε-prune**: zero entries below threshold; renormalize to maintain probability distribution
+7. **Dictionary step (MOD)**: Update bank using linear solve instead of matrix inverse:
+   - Solve `(A A^T + λ_B I) B^T = (A X^T)^T` where `A` is stacked codes, `X` is stacked targets
+   - **Unit Frobenius normalize** atoms; rescale codes to preserve reconstruction
+8. **Batched adapter refit**: Solve normal equations using Cholesky decomposition:
+   - `G_i = B_i B_i^T + λ_A I`, `R_i = W_i B_i^T` for all experts
+   - Batched solve: `A_i = cholesky_solve(R_i^T, cholesky(G_i))^T`
+9. **Temperature control**: Adjust T to target median support with min/max bounds:
+   - `T ← clamp(T · exp(η · (med_support/target - 1)), T_min, T_max)`
+10. **Repeat 6–9** for S steps; early-stop on validation MSE plateau and stable supports
 
 ---
 
@@ -42,29 +51,41 @@ Concise plan for initializing and training a **single global basis bank** (Up & 
 
 ## 5) Metrics to Log (Weights & Biases)
 **Reconstruction & capacity**
-- **MSE_F**: Frobenius MSE per family (Up/Gate) and per layer; global mean.
-- **Energy captured**: \sum_{k≤r} σ_k^2 / \sum σ_k^2 (at init and periodically) for a sample of experts.
-- **Effective rank** (95% energy) per family/layer (periodic).
+- **Relative Frobenius error**: `||recon - W||_F / ||W||_F` per family and globally
+- **Seeding quality**: Explained variance and method-specific metrics from warm start
+- **Energy captured**: Initial reconstruction quality from seeding methods
 
-**Sparsity & mixtures**
-- **Support sizes**: mean/median/min/max |supp(α_i)|; histogram; **entropy** H(α_i).
-- **Temperature** trajectory T; **L1 penalty** value; % of coefficients < ε (pruned).
-- **Base popularity**: usage frequency per atom; Jaccard overlap of supports across families (Up vs Gate).
+**Sparsity & mixtures**  
+- **Support sizes**: median/mean/p95 `|supp(α_i)|`; target vs actual support error
+- **Temperature trajectory**: T values with min/max bounds; support stability
+- **Entropy**: `H(α_i) = -Σ α_i log α_i` using proper zero-handling; pruning fractions
+- **Base popularity**: atom usage frequencies; support overlap patterns
 
-**Stability & diversity**
-- **Atom norms** (after normalization); **coherence** between atoms (e.g., ||B^T B − I||_F).
-- **Condition numbers** of `(A A^T)` in MOD updates; fallback count if regularized.
+**Numerical stability**
+- **Atom norms**: deviation from unit normalization; max norm deviation
+- **Health checks**: NaN/Inf counts across tensors; Cholesky vs general solve fallbacks
+- **Regularization**: λ_B and λ_A effectiveness; condition number improvements
 
 **Runtime & resources**
 - Step time; memory footprint; I/O throughput.
 
 **Ablation hooks**
-- Sweep logs keyed by `(m, r, target_support, S_cache)`.
+- Sweep logs keyed by `(seeding_method, m, r, target_support, λ_B, λ_A)`.
 
 ---
 
-## 6) Stopping & Sanity Checks
-- Validation MSE plateaus for N evaluations **and** support distribution stabilized.
-- Random expert spot‑checks: reconstruct `W_i` and compare spectra & top singular vectors alignment.
-- Compose→patch→forward on a tiny input: parity of activations between reconstructed FFN and original within tolerance.
+## 6) Implementation Notes & Future Improvements
+
+**Current implementation features:**
+- Multiple warm start methods with MPS compatibility for Mac M-series development
+- Numerically stable AM loop using linear solvers and Cholesky decomposition
+- Alpha state management (no logit drift) for consistent entmax sparsity patterns
+- Batched operations for 5-10x speedup in adapter refit
+- Comprehensive metrics and device-aware fallbacks
+
+**Potential improvements:**
+- Weight-aware MOD targeting current mixed bases instead of fixed SVD targets
+- Coherence penalties to discourage atom duplication
+- Advanced temperature schedules and top-K sparsity constraints
+- Streaming implementations for very large expert counts
 

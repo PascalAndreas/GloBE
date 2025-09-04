@@ -20,10 +20,11 @@ import wandb
 
 from globe.init.init_bank import (
     InitConfig,
-    truncated_svd,
+    create_warm_start,
     build_initial_bank,
     am_step,
 )
+from globe.init.warm_start import SeedingConfig, SeedingMethod
 from globe.modules.globe_bank import GloBEBank, DualGloBEBank
 from globe.modules.globe_mixer import SparseMixer
 from globe.init.zscore import normalize_expert_families, ZScoreNormalizer
@@ -46,6 +47,8 @@ class AlternatingBankTrainer:
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
         normalize_experts: bool = True,
+        seeding_method: SeedingMethod = SeedingMethod.TS_PCA,
+        seeding_config: Optional[SeedingConfig] = None,
     ) -> None:
         self.rank = rank
         self.num_bases = num_bases
@@ -59,6 +62,11 @@ class AlternatingBankTrainer:
                 device = torch.device("cpu")
         self.device = device
         self.dtype = dtype
+        
+        # Set up seeding configuration
+        if seeding_config is None:
+            seeding_config = SeedingConfig(method=seeding_method)
+        self.seeding_config = seeding_config
 
     # ------------------------------------------------------------------
     def train(
@@ -89,18 +97,22 @@ class AlternatingBankTrainer:
         
         if self.normalize_experts:
             working_weights, normalizer = normalize_expert_families(expert_weights)
-            if log_wandb:
-                # Log normalization stats
+            if log_wandb and wandb.run is not None:
+                # Log normalization stats with explicit step to avoid conflicts
+                zscore_metrics = {}
                 for family in working_weights.keys():
                     if family in normalizer.stats:
                         stats = normalizer.stats[family]
-                        wandb.log({
+                        zscore_metrics.update({
                             f"{family}/zscore_mean_norm": torch.norm(stats.mean).item(),
                             f"{family}/zscore_std_mean": stats.std.mean().item(),
                             f"{family}/zscore_std_std": stats.std.std().item(),
                         })
+                # Log z-score stats at step -1 to avoid conflicts with AM loop steps
+                wandb.log(zscore_metrics, step=-1)
 
         results: Dict[str, Dict[str, torch.Tensor]] = {}
+        global_step = 0  # Global step counter across all families
 
         for family, weights in working_weights.items():
             if not weights:
@@ -124,9 +136,10 @@ class AlternatingBankTrainer:
                 dtype=self.dtype,
                 target_support=target_support,
                 temperature=temperature_init,
+                seeding_config=self.seeding_config,
             )
 
-            A0, B0, energy = truncated_svd(W, rank)
+            A0, B0, energy, seeding_metrics = create_warm_start(W, rank, self.seeding_config)
             bank0, alpha0 = build_initial_bank(B0, cfg)
             
             # Get hidden dimension from the weight tensor
@@ -134,79 +147,40 @@ class AlternatingBankTrainer:
             bank_module = GloBEBank(num_bases, rank, hidden_dim, activation=activation).to(
                 self.device, self.dtype
             )
-            bank_module.bases.data.copy_(bank0)
+            with torch.no_grad():
+                bank_module.bases.copy_(bank0)
 
-            # Initialize logits more carefully to avoid -inf
-            alpha_logits = (alpha0 + cfg.epsilon).log()  # Add epsilon before log to avoid -inf
+            # Use alpha directly instead of logits to avoid entmax drift
+            alpha = alpha0.clone()
             A = A0.to(self.device, self.dtype)
             T = temperature_init
             loss = 0.0
             
-            # Early stopping tracking
-            eval_window = 5  # Evaluate stability every N steps
-            history = {"rMSE": [], "support_error": [], "coherence_max": []}
-            best_loss = float('inf')
-            patience_counter = 0
-            max_patience = 10
 
-            # Log initial energy capture
+            # Log initial energy capture and seeding metrics
             if log_wandb and wandb.run is not None:
-                wandb.log({
+                seeding_log = {
                     f"{family}/initial_energy_captured": energy.mean().item(),
                     f"{family}/initial_energy_std": energy.std().item(),
-                })
+                }
+                # Add seeding-specific metrics
+                for key, value in seeding_metrics.items():
+                    if isinstance(value, (int, float)):
+                        seeding_log[f"{family}/seeding_{key}"] = value
+                    elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float)):
+                        # Log first few values of lists
+                        seeding_log[f"{family}/seeding_{key}_first"] = value[0]
+                        if len(value) > 1:
+                            seeding_log[f"{family}/seeding_{key}_mean"] = sum(value) / len(value)
+                
+                wandb.log(seeding_log)
 
             for step in range(num_steps):
-                alpha_logits, A, loss, T, med, metrics = am_step(
-                    W, B0, bank_module, alpha_logits, A, T, cfg, step=step, log_metrics=log_wandb
+                alpha, A, loss, T, med, metrics = am_step(
+                    W, B0, bank_module, alpha, A, T, cfg, step=step, 
+                    log_metrics=log_wandb, log_frequency=3  # Log every 3 steps for speed
                 )
-                
-                # Early stopping logic
-                if log_wandb and metrics and wandb.run is not None:
-                    # Track key stability metrics
-                    current_rMSE = metrics.get('recon/rMSE', loss)
-                    support_error = abs(metrics.get('alpha/support_error', 0))
-                    coherence_max = metrics.get('bank/coherence_offdiag_max', 0)
-                    
-                    history["rMSE"].append(current_rMSE)
-                    history["support_error"].append(support_error)
-                    history["coherence_max"].append(coherence_max)
-                    
-                    # Check for improvement
-                    if current_rMSE < best_loss:
-                        best_loss = current_rMSE
-                        patience_counter = 0
-                    else:
-                        patience_counter += 1
-                    
-                    # Evaluate stability every eval_window steps
-                    if step > 0 and step % eval_window == 0 and len(history["rMSE"]) >= eval_window:
-                        recent_rMSE = history["rMSE"][-eval_window:]
-                        recent_support = history["support_error"][-eval_window:]
-                        recent_coherence = history["coherence_max"][-eval_window:]
-                        
-                        # Check stability criteria
-                        stable_criteria = [
-                            current_rMSE <= 0.02 or (max(recent_rMSE) - min(recent_rMSE)) < 1e-4,  # rMSE stable
-                            support_error <= 1,  # Support size within target
-                            max(recent_coherence) <= 0.15,  # Coherence acceptable
-                            metrics.get('health/nan_infs', 0) == 0,  # No NaN/Inf
-                        ]
-                        
-                        if all(stable_criteria):
-                            print(f"\n✅ {family.upper()} converged at step {step} (rMSE: {current_rMSE:.6f})")
-                            if log_wandb and wandb.run is not None:
-                                wandb.log({f"{family}/converged_at_step": step})
-                            break
-                        
-                        # Hard stop criteria
-                        if (
-                            metrics.get('health/nan_infs', 0) > 0 or
-                            current_rMSE > best_loss + 0.01 or  # Significant degradation
-                            patience_counter >= max_patience
-                        ):
-                            print(f"\n⚠️  {family.upper()} stopped early at step {step} (patience: {patience_counter})")
-                            break
+                current_global_step = global_step + step
                 
                 if log_wandb and metrics and wandb.run is not None:
                     # Log family-specific metrics with proper prefixes
@@ -220,17 +194,15 @@ class AlternatingBankTrainer:
                         f"{family}/median_support": med,
                         f"{family}/temperature": T,
                         f"{family}/step": step,
-                        f"{family}/patience_counter": patience_counter,
-                        f"{family}/best_loss": best_loss,
                     })
                     
-                    wandb.log(family_metrics, step=step)
+                    wandb.log(family_metrics, step=current_global_step)
 
-            final_alpha = (
-                entmax15(alpha_logits / T, dim=-1)
-                if entmax15 is not None
-                else F.softmax(alpha_logits / T, dim=-1)
-            )
+            # Update global step counter for next family
+            global_step += num_steps
+            
+            # alpha is already the final mixture weights (no need to convert from logits)
+            final_alpha = alpha
             
             # Store results (adapters will be folded later if normalization was used)
             results[family] = {

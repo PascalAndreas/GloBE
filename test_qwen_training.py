@@ -22,6 +22,7 @@ sys.path.insert(0, str(project_root))
 from globe.data.naming_qwen15 import extract_expert_weights, extract_all_expert_info
 from globe.train.fit_banks import AlternatingBankTrainer, fold_normalization_into_adapters, build_dual_globe_bank
 from globe.init.init_bank import InitConfig
+from globe.init.warm_start import SeedingMethod, SeedingConfig, get_seeding_method_info
 
 
 def get_model_dtype(model_name: str) -> torch.dtype:
@@ -45,7 +46,8 @@ def train_banks_minimal_test(
     basis_ratio: float = 0.5,  # num_bases = basis_ratio * num_experts
     device: str = "auto",
     model_name: str = "Qwen/Qwen1.5-MoE-A2.7B",
-    log_wandb: bool = False
+    log_wandb: bool = False,
+    seeding_method: str = "ts_pca"
 ) -> Dict[str, Any]:
     """Run a minimal bank training test."""
     # Get dimensions from first expert
@@ -57,10 +59,23 @@ def train_banks_minimal_test(
     rank = int(rank_ratio * up_dim)  # rank = rank_ratio * projection_dim
     num_bases = int(basis_ratio * num_experts)  # num_bases = basis_ratio * num_experts
     
+    # Parse seeding method
+    try:
+        seeding_enum = SeedingMethod(seeding_method.lower())
+    except ValueError:
+        available_methods = list(SeedingMethod)
+        raise ValueError(f"Invalid seeding method '{seeding_method}'. Available: {[m.value for m in available_methods]}")
+    
+    seeding_config = SeedingConfig(method=seeding_enum)
+    method_info = get_seeding_method_info()[seeding_method.lower()]
+    
     print(f"\n🚀 Starting minimal bank training test...")
     print(f"   - Steps: {num_steps}")
     print(f"   - Rank: {rank} ({rank_ratio:.1%} of projection dim)")
     print(f"   - Num bases: {num_bases} ({basis_ratio:.1%} of experts)")
+    print(f"   - Seeding method: {method_info['name']}")
+    print(f"   - Method description: {method_info['description']}")
+    print(f"   - Speed: {method_info['speed']}, Quality: {method_info['quality']}, MPS-friendly: {method_info['mps_friendly']}")
     
     # Auto-detect device
     if device == "auto":
@@ -89,13 +104,14 @@ def train_banks_minimal_test(
     print(f"   - Rank: {rank} (ratio: {rank_ratio:.2f})")
     print(f"   - Num bases: {num_bases} (ratio: {basis_ratio:.2f})")
     
-    # Create trainer with appropriate dtype
+    # Create trainer with appropriate dtype and seeding method
     trainer = AlternatingBankTrainer(
         rank=rank,
         num_bases=num_bases,
         device=device,
         dtype=model_dtype,
-        normalize_experts=True
+        normalize_experts=True,
+        seeding_config=seeding_config
     )
     
     # Configure per-family settings
@@ -149,6 +165,7 @@ def train_banks_minimal_test(
                 "num_steps": num_steps,
                 "num_experts": num_experts,
                 "projection_dim": up_dim,
+                "seeding_method": seeding_method,
             }
         }
         
@@ -292,11 +309,21 @@ def main():
     parser.add_argument("--wandb-project", default="globe-bank-training", help="Wandb project name")
     parser.add_argument("--wandb-name", default=None, help="Wandb run name")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--seeding-method", default="ts_pca", choices=["svd", "ts_pca", "left_gram_pca", "spherical_kmeans", "residual_greedy", "hybrid"], help="Seeding method for bank initialization")
     
     args = parser.parse_args()
     
     print("🌍 GloBE Bank Training Test")
     print("=" * 50)
+    
+    # Show available seeding methods
+    if args.seeding_method == "svd":
+        print("⚠️  Using SVD seeding - this will be slow on Mac but provides high quality baseline")
+    else:
+        method_info = get_seeding_method_info()[args.seeding_method]
+        print(f"🚀 Using {method_info['name']} seeding method")
+        print(f"   Speed: {method_info['speed']}, Quality: {method_info['quality']}, MPS-friendly: {method_info['mps_friendly']}")
+    print()
     
     # Initialize wandb if enabled
     if not args.no_wandb:
@@ -311,6 +338,7 @@ def main():
                 "basis_ratio": args.basis_ratio,
                 "max_experts": args.max_experts,
                 "device": args.device,
+                "seeding_method": args.seeding_method,
             },
             tags=["test", "qwen", "globe"],
         )
@@ -337,7 +365,8 @@ def main():
             basis_ratio=args.basis_ratio,
             device=args.device,
             model_name=args.model,
-            log_wandb=not args.no_wandb
+            log_wandb=not args.no_wandb,
+            seeding_method=args.seeding_method
         )
         
         # Step 4: Test reconstruction quality

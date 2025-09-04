@@ -13,7 +13,8 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from globe.modules.globe_bank import GloBEBank, DualGloBEBank
-from globe.init.init_bank import truncated_svd, build_initial_bank, InitConfig
+from globe.init.init_bank import create_warm_start, build_initial_bank, InitConfig
+from globe.init.warm_start import SeedingConfig, SeedingMethod
 
 
 def test_globe_bank_basic():
@@ -94,11 +95,13 @@ def test_svd_and_initialization():
     W_stack = torch.stack(experts)  # E × p × d
     print(f"✅ Created {num_experts} synthetic experts with shape {W_stack.shape}")
     
-    # Test SVD
+    # Test warm start seeding
     rank = 8
-    A0, B0, energy = truncated_svd(W_stack, rank)
+    # Use default TS-PCA seeding method
+    seeding_config = SeedingConfig(method=SeedingMethod.TS_PCA)
+    A0, B0, energy, seeding_metrics = create_warm_start(W_stack, rank, seeding_config)
     
-    print(f"✅ SVD decomposition successful")
+    print(f"✅ Warm start seeding successful")
     print(f"   A0 shape: {A0.shape}")  # E × p × r
     print(f"   B0 shape: {B0.shape}")  # E × r × d
     print(f"   Energy captured: {energy.mean():.3f} ± {energy.std():.3f}")
