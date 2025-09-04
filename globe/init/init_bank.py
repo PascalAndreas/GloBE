@@ -147,7 +147,7 @@ def create_warm_start(weights: Tensor, rank: int, seeding_config: Optional[Seedi
         
         # Compute energy captured (reconstruction quality)
         recon = A_i @ B_i
-        mse = torch.nn.functional.mse_loss(recon, W_i)
+        mse = F.mse_loss(recon, W_i)
         w_norm_sq = (W_i ** 2).sum()
         energy_captured = 1.0 - (mse * W_i.numel()) / w_norm_sq.clamp_min(1e-8)
         energy.append(float(energy_captured))
@@ -329,7 +329,11 @@ def am_step(
         bank_module.bases.copy_(new_bank)
 
     # Batched adapter refit using normal equations + Cholesky -----------
-    mixed = bank_module(alpha)  # E × r × d
+    # Make the nonlinearity explicit: first form the linear mixture then apply
+    # the bank's activation.  ``alpha`` is ``E×m`` and bases ``m×r×d`` ->
+    # ``E×r×d``.
+    mixed_linear = torch.einsum('em,mrd->erd', alpha, bank_module.bases)
+    mixed = bank_module.activation(mixed_linear)
     
     # Ensure W and A are on the correct device
     W = W.to(device)
@@ -377,7 +381,8 @@ def am_step(
 
     # Reconstruction loss -------------------------------------------------
     recon = torch.einsum("epr,erd->epd", A, mixed)
-    loss = F.mse_loss(recon, W)
+    diff = recon - W
+    loss = (diff ** 2).mean()
 
     # Temperature update --------------------------------------------------
     support = (alpha > cfg.epsilon).sum(dim=-1).float()
@@ -388,32 +393,30 @@ def am_step(
     T = max(min(T_new, cfg.max_temperature), cfg.min_temperature)
 
     # Collect comprehensive metrics (only when needed)
-    metrics = {}
+    recon_error_norm = diff.norm().item()
+    W_frobenius_norm = W.norm().item()
+    relative_error = (
+        recon_error_norm / W_frobenius_norm if W_frobenius_norm > 0 else recon_error_norm
+    )
+
+    metrics = {'recon/relative_frobenius_error': relative_error}
     if log_metrics:
-        # A. Global reconstruction (weight space) - Proper relative Frobenius error
         recon_mse = loss.item()
-        # Compute relative Frobenius error: ||recon - W||_F / ||W||_F
-        recon_error_norm = torch.norm(recon - W).item()
-        W_frobenius_norm = torch.norm(W).item()
-        relative_error = recon_error_norm / W_frobenius_norm if W_frobenius_norm > 0 else recon_error_norm
-        metrics.update({
-            'recon/relative_frobenius_error': relative_error,
-            'recon/MSE': recon_mse,
-        })
-        
+        metrics['loss/total'] = recon_mse
+
         # B. Coding step (α: entmax/sparsemax) - Keep on device for speed
         support_sizes = (alpha > cfg.epsilon).sum(dim=-1).float()
         # Better entropy calculation avoiding small bias
         entropy_vals = -torch.where(alpha > 0, alpha * alpha.log(), torch.zeros_like(alpha)).sum(dim=-1)
         pruned_frac = (alpha < cfg.epsilon).float().mean().item()
-        
+
         metrics.update({
             'alpha/median_support': support_sizes.median().item(),
             'alpha/mean_support': support_sizes.mean().item(),
             'alpha/p95_support': support_sizes.quantile(0.95).item(),
             'alpha/entropy_mean': entropy_vals.mean().item(),
             'alpha/epsilon_prune_frac': pruned_frac,
-            'alpha/temp_T': T,
+            'alpha/temp': T,
             'alpha/target_support': cfg.target_support,
             'alpha/support_error': support_sizes.median().item() - cfg.target_support,
         })
@@ -443,10 +446,8 @@ def am_step(
         
         metrics.update({
             'health/nan_infs': nan_infs,
-            'loss/total': recon_mse,
-            'loss/recon': recon_mse,
         })
-    
+
     return alpha.detach(), A, float(loss.detach()), T, med, metrics
 
 

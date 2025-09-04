@@ -181,32 +181,29 @@ class AlternatingBankTrainer:
                 print(f"\r      [{bar}] {step+1:2d}/{num_steps} steps | ", end="", flush=True)
                 
                 alpha, A, loss, T, med, metrics = am_step(
-                    W, B0, bank_module, alpha, A, T, cfg, step=step, 
+                    W, B0, bank_module, alpha, A, T, cfg, step=step,
                     log_metrics=log_wandb
                 )
-                
+
                 # Update progress bar with current metrics
-                print(f"Loss: {loss:.4f} | Support: {med:.1f} | T: {T:.2f}", end="", flush=True)
+                rel_frob = metrics.get("recon/relative_frobenius_error", float("nan"))
+                print(
+                    f"Loss: {loss:.4f} | RelFrob: {rel_frob:.4f} | Support: {med:.1f} | T: {T:.2f}",
+                    end="",
+                    flush=True,
+                )
                 
                 if log_wandb and metrics and wandb.run is not None:
-                    # Log family-specific metrics with proper prefixes and family-specific step counter
-                    family_metrics = {}
-                    for key, value in metrics.items():
-                        family_metrics[f"{family}/{key}"] = value
-                    
-                    # Add basic metrics for backward compatibility
-                    family_metrics.update({
-                        f"{family}/loss": float(loss),
-                        f"{family}/median_support": med,
-                        f"{family}/temperature": T,
-                        f"{family}/step": step,
-                    })
-                    
-                    # Use family-specific step counter to avoid overlap
+                    # Prefix metrics with family name and log once
+                    family_metrics = {f"{family}/{k}": v for k, v in metrics.items()}
+                    family_metrics[f"{family}/step"] = step
                     wandb.log(family_metrics, step=step)
             
             # Complete the progress bar
-            print(f"\r      [{'█' * bar_length}] {num_steps:2d}/{num_steps} steps | Final - Loss: {loss:.4f} | Support: {med:.1f} | T: {T:.2f}")
+            final_rel = metrics.get("recon/relative_frobenius_error", float("nan"))
+            print(
+                f"\r      [{'█' * bar_length}] {num_steps:2d}/{num_steps} steps | Final - Loss: {loss:.4f} | RelFrob: {final_rel:.4f} | Support: {med:.1f} | T: {T:.2f}"
+            )
             print(f"      ✅ {family.upper()} training completed!")
             
             # alpha is already the final mixture weights (no need to convert from logits)
@@ -223,53 +220,36 @@ class AlternatingBankTrainer:
 
 
 def fold_normalization_into_adapters(
-    results: Dict[str, Dict[str, torch.Tensor]], 
+    results: Dict[str, Dict[str, torch.Tensor]],
     normalizer: ZScoreNormalizer
 ) -> Dict[str, Dict[str, torch.Tensor]]:
-    """Fold z-score normalization back into adapter matrices as per workflow step 11.
-    
-    This modifies the adapters so that A_folded = A_normalized * std + mean,
-    effectively undoing the normalization at the adapter level.
+    """Fold row-wise z-score scaling back into adapter matrices.
+
+    The training loop operates on normalised weights ``W¯``.  To deploy the
+    learned adapters in the original space we need to left-multiply them by the
+    diagonal scaling matrix ``D`` defined during normalisation.  Since we do not
+    centre the weights, this reduces to a simple row-wise multiplication.
     """
     if normalizer is None:
         return results
-    
-    folded_results = {}
+
+    folded_results: Dict[str, Dict[str, torch.Tensor]] = {}
     for family, family_results in results.items():
         if family not in normalizer.stats:
             folded_results[family] = family_results
             continue
-            
+
         stats = normalizer.stats[family]
         adapters = family_results["adapters"]  # E × p × r
-        
-        # Fold normalization: A_folded = A * std + mean (broadcasted appropriately)
-        # adapters: E × p × r, stats.std: p × d, stats.mean: p × d
-        # We need to be careful about dimensions here
-        
-        # For the folding to work correctly, we need to think about the reconstruction:
-        # Original: W_i = A_i @ B_mixed where B_mixed comes from normalized bases
-        # After folding: W_i = A_folded @ B_mixed where A_folded accounts for denormalization
-        
-        # Since the bases were trained on normalized data, the adapters need to be scaled
-        # to account for the fact that they'll be applied to the same bases but we want
-        # the final result to be in the original scale.
-        
-        # The correct folding depends on how the reconstruction works:
-        # If W_normalized = A @ B and W_original = W_normalized * std + mean,
-        # then we need A_folded such that A_folded @ B = A @ B * std + mean
-        # This is not straightforward because std and mean are per-position, not scalars.
-        
-        # For now, we'll store the normalization info separately and handle folding
-        # during the actual weight reconstruction in the GloBEFFN forward pass.
-        folded_results[family] = {
-            **family_results,
-            "normalization_stats": {
-                "mean": stats.mean,
-                "std": stats.std,
-            }
-        }
-    
+
+        # ``stats.std`` has shape ``p × d`` with the same value repeated across
+        # the hidden dimension.  Extract the per-row scale and broadcast to the
+        # adapter shape.
+        row_scale = stats.std[:, 0].view(1, -1, 1)  # 1 × p × 1
+        A_folded = adapters * row_scale
+
+        folded_results[family] = {**family_results, "adapters": A_folded}
+
     return folded_results
 
 
