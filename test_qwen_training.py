@@ -10,6 +10,7 @@ import os
 import sys
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 import argparse
 import json
 import wandb
@@ -193,7 +194,11 @@ def test_reconstruction_quality(training_output: Dict[str, Any], expert_weights:
     """Test reconstruction quality of trained banks with NaN detection."""
     print(f"\n🔍 Testing reconstruction quality...")
     
-    results = training_output["results"]
+    # Fold row-wise normalisation back into the adapters so that we evaluate
+    # reconstruction in the original weight space.
+    results = fold_normalization_into_adapters(
+        training_output["results"], training_output["normalizer"]
+    )
     device = training_output["device"]
     
     for family in ['up', 'gate']:
@@ -234,15 +239,16 @@ def test_reconstruction_quality(training_output: Dict[str, Any], expert_weights:
         reconstructions = []
         
         for i in range(num_experts):
-            # Mix bases: Σ_j α_{i,j} B_j
-            mixed_basis = torch.einsum('m,mrd->rd', codes[i], bank)  # r × d
-            
+            # Mix bases: Σ_j α_{i,j} B_j then apply activation
+            mixed_linear = torch.einsum('m,mrd->rd', codes[i], bank)  # r × d
+            mixed_basis = F.silu(mixed_linear)
+
             # Check for NaN in mixed basis
             if torch.isnan(mixed_basis).any():
                 print(f"   ⚠️  NaN in mixed_basis for expert {i}")
                 print(f"      codes[{i}] range: [{codes[i].min():.6f}, {codes[i].max():.6f}]")
                 print(f"      codes[{i}] sum: {codes[i].sum():.6f}")
-            
+
             # Apply adapter: A_i @ mixed_basis
             reconstruction = torch.matmul(adapters[i], mixed_basis)  # p × d
             

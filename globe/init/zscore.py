@@ -15,8 +15,11 @@ from torch import Tensor
 
 @dataclass
 class ZScoreStats:
-    """Container for mean/std statistics of a weight family."""
+    """Container for scaling statistics of a weight family."""
 
+    # Row-wise scale (σ) used for z-score normalisation.  We keep a ``mean``
+    # field for backward compatibility but it is always zero in the current
+    # workflow which operates purely on rescaled weights without centring.
     mean: Tensor
     std: Tensor
 
@@ -31,9 +34,16 @@ class ZScoreNormalizer:
     # ------------------------------------------------------------------
     def fit(self, expert_weights: Dict[str, List[Tensor]]) -> None:
         """Collect layerwise statistics across all experts for each family.
-        
-        Following MoBE paper: compute mean/std across all expert weights in the family,
-        not per-position. This gives scalar mean and std per family.
+
+        Following the refined workflow, we compute a *row-wise* scale for each
+        family without centring.  For a given row ``k`` we use
+
+        ``sigma_k = sqrt(1/(E*d) * sum_{i,j} W_i[k, j]^2)``
+
+        where ``E`` is the number of experts and ``d`` the hidden dimension.
+        This produces a diagonal scaling matrix ``D`` used throughout
+        training.  Means are set to zero which keeps the implementation
+        compatible with earlier versions while avoiding per-expert offsets.
         """
 
         self.stats = {}
@@ -41,17 +51,15 @@ class ZScoreNormalizer:
             if not weights:
                 continue
             stacked = torch.stack(weights, dim=0)  # E × p × d
-            
-            # MoBE paper approach: compute scalar statistics across all weights
-            # This treats the entire weight matrix collection as a single distribution
-            all_weights = stacked.view(-1)  # Flatten all expert weights
-            mean = all_weights.mean()  # Scalar mean
-            std = all_weights.std().clamp_min(self.eps)  # Scalar std
-            
-            # Convert to same shape as original for broadcasting compatibility
-            mean_expanded = torch.full_like(stacked[0], mean)
-            std_expanded = torch.full_like(stacked[0], std)
-            
+
+            # Compute row-wise root-mean-square (no centring)
+            # Resulting shape: p
+            row_rms = torch.sqrt((stacked ** 2).mean(dim=(0, 2))).clamp_min(self.eps)
+
+            # Expand to ``p × d`` for broadcasting with original weights
+            std_expanded = row_rms.view(-1, 1).expand_as(stacked[0])
+            mean_expanded = torch.zeros_like(std_expanded)
+
             self.stats[family] = ZScoreStats(mean=mean_expanded, std=std_expanded)
 
     # ------------------------------------------------------------------
@@ -67,7 +75,8 @@ class ZScoreNormalizer:
                 out[family] = weights
                 continue
             stats = self.stats[family]
-            out[family] = [(w - stats.mean) / stats.std for w in weights]
+            # Mean is zero so we simply divide by the row-wise scale
+            out[family] = [w / stats.std for w in weights]
         return out
 
     # ------------------------------------------------------------------
@@ -83,7 +92,8 @@ class ZScoreNormalizer:
                 out[family] = weights
                 continue
             stats = self.stats[family]
-            out[family] = [w * stats.std + stats.mean for w in weights]
+            # Means are zero so inverse is simply multiplication by the scale
+            out[family] = [w * stats.std for w in weights]
         return out
 
     # ------------------------------------------------------------------

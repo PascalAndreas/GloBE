@@ -7,6 +7,7 @@ without requiring model downloads. Useful for debugging and development.
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
 import sys
@@ -150,7 +151,8 @@ def validate_am_loop():
         reconstructions = []
         
         for i in range(num_experts):
-            mixed_basis = torch.einsum('m,mrd->rd', codes[i], bank)
+            mixed_linear = torch.einsum('m,mrd->rd', codes[i], bank)
+            mixed_basis = F.silu(mixed_linear)
             reconstruction = torch.matmul(adapters[i], mixed_basis)
             reconstructions.append(reconstruction)
         
@@ -194,12 +196,10 @@ def validate_am_loop():
     # Test folding
     print(f"\n🔄 Testing normalization folding...")
     folded_results = fold_normalization_into_adapters(results, normalizer)
-    
+
     for family in ['up', 'gate']:
-        if 'normalization_stats' in folded_results[family]:
-            print(f"   - {family.upper()} normalization stats preserved")
-        else:
-            print(f"   - {family.upper()} no normalization stats")
+        if family in folded_results:
+            print(f"   - {family.upper()} adapters folded")
     
     print(f"\n🎉 Validation completed!")
     
