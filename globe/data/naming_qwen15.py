@@ -190,7 +190,9 @@ def extract_expert_weights(
     model_name_or_path: str, 
     include_shared: bool = False,
     force_download: bool = False,
-    max_experts: Optional[int] = None
+    max_experts: Optional[int] = None,
+    layers: Optional[List[int]] = None,
+    sample_method: str = "first_n"
 ) -> Dict[str, List[torch.Tensor]]:
     """Load a HuggingFace model and extract expert weights grouped by family.
 
@@ -200,6 +202,10 @@ def extract_expert_weights(
                        only extract routed experts for bank training.
         force_download: If True, force re-download even if cached
         max_experts: If provided, limit to this many experts (for memory efficiency)
+        layers: If provided, extract experts only from these layer indices (e.g., [12, 13, 14])
+        sample_method: How to sample experts when max_experts is set:
+                      - "first_n": Take first n experts
+                      - "evenly_spaced": Take evenly spaced experts across all available
 
     Returns:
         Dictionary with 'up' and 'gate' families containing expert weight tensors.
@@ -225,6 +231,10 @@ def extract_expert_weights(
             continue
         ttype = info["type"]
         
+        # Skip if layers are specified and this isn't one of the right layers
+        if layers is not None and "layer" in info and info["layer"] not in layers:
+            continue
+        
         # Skip shared experts unless explicitly requested
         if ttype.startswith("shared_") and not include_shared:
             continue
@@ -244,14 +254,31 @@ def extract_expert_weights(
     
     # Apply expert limit if requested (for memory efficiency)
     if max_experts is not None:
-        print(f"🔧 Limiting to {max_experts} experts for memory efficiency")
+        print(f"🔧 Limiting to {max_experts} experts using {sample_method} method")
         for family in families:
             if len(families[family]) > max_experts:
-                # Take evenly spaced experts to maintain representativeness
-                indices = torch.linspace(0, len(families[family]) - 1, max_experts).long()
                 original_count = len(families[family])
-                families[family] = [families[family][i] for i in indices]
+                
+                if sample_method == "first_n":
+                    # Take first n experts
+                    families[family] = families[family][:max_experts]
+                elif sample_method == "evenly_spaced":
+                    # Take evenly spaced experts to maintain representativeness
+                    indices = torch.linspace(0, len(families[family]) - 1, max_experts).long()
+                    families[family] = [families[family][i] for i in indices]
+                else:
+                    raise ValueError(f"Unknown sample_method: {sample_method}. Use 'first_n' or 'evenly_spaced'")
+                
                 print(f"   - {family}: {original_count} → {len(families[family])} experts")
+    
+    # Report extraction results
+    if layers is not None:
+        if len(layers) == 1:
+            print(f"✅ Extracted from layer {layers[0]}: {len(families['up'])} UP, {len(families['gate'])} Gate experts")
+        else:
+            print(f"✅ Extracted from layers {layers}: {len(families['up'])} UP, {len(families['gate'])} Gate experts")
+    else:
+        print(f"✅ Extracted from all layers: {len(families['up'])} UP, {len(families['gate'])} Gate experts")
                 
     return families
 

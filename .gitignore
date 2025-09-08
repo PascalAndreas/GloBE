@@ -1,5 +1,6 @@
 /globe_env/
 /test_output/
+/wandb_logs/
 /wandb/
 __pycache__/
 *.pyc

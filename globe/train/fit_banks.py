@@ -12,8 +12,6 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional, Tuple
 
-import hydra
-from omegaconf import DictConfig
 import torch
 import torch.nn.functional as F
 import wandb
@@ -23,18 +21,12 @@ from globe.init.init_bank import (
     create_warm_start,
     build_initial_bank,
     am_step,
+    update_temperature,
+    update_adaptive_schedule,
 )
 from globe.init.warm_start import SeedingConfig, SeedingMethod
 from globe.modules.globe_bank import GloBEBank, DualGloBEBank
-from globe.modules.globe_mixer import SparseMixer
-from globe.init.zscore import normalize_expert_families, ZScoreNormalizer
-from globe.data.naming_qwen15 import extract_expert_weights
-
-
-try:  # entmax is optional
-    from entmax import entmax15
-except Exception:  # pragma: no cover - fallback
-    entmax15 = None
+# Legacy imports removed - SparseMixer and extract_expert_weights not needed here
 
 
 class AlternatingBankTrainer:
@@ -46,7 +38,7 @@ class AlternatingBankTrainer:
         num_bases: int,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
-        normalize_experts: bool = True,
+        normalize_experts: bool = False,
         seeding_method: SeedingMethod = SeedingMethod.TS_PCA,
         seeding_config: Optional[SeedingConfig] = None,
     ) -> None:
@@ -67,6 +59,18 @@ class AlternatingBankTrainer:
         if seeding_config is None:
             seeding_config = SeedingConfig(method=seeding_method)
         self.seeding_config = seeding_config
+        
+        # Pre-allocate performance buffers
+        self._identity_buffers = {}
+
+    def _get_identity_buffers(self, rank: int, num_bases: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get or create cached identity matrices."""
+        key = (rank, num_bases, self.device, self.dtype)
+        if key not in self._identity_buffers:
+            I_r = torch.eye(rank, device=self.device, dtype=self.dtype)
+            I_m = torch.eye(num_bases, device=self.device, dtype=self.dtype)
+            self._identity_buffers[key] = (I_r, I_m)
+        return self._identity_buffers[key]
 
     # ------------------------------------------------------------------
     def train(
@@ -74,35 +78,35 @@ class AlternatingBankTrainer:
         expert_weights: Dict[str, List[torch.Tensor]],
         family_configs: Optional[Dict[str, Dict]] = None,
         num_steps: int = 25,
-        temperature_init: float = 1.0,
         target_support: int = 12,
         activation: str = "silu",
         log_wandb: bool = True,
-        # Conservative hyperparameters
-        min_temperature: float = 0.5,
-        lambda_A: float = 1e-6,
+        # JW-MOD parameters
+        tau: float = 1.0,
+        lambda_A: float = 1e-4,
         lambda_B: float = 1e-4,
-        epsilon: float = 1e-4,
-    ) -> Tuple[Dict[str, Dict[str, torch.Tensor]], Optional[ZScoreNormalizer]]:
-        """Train banks for the provided expert weight families.
+        lambda_T: float = 1e-4,
+        j_min: float = 1e-3,
+        eta: float = 0.5,
+        # route_w_start removed - superseded by λ/β scheduling
+        epsilon: float = 1e-4,  # For support calculation compatibility
+        # Temperature control
+        temp_control_freq: int = 5,
+        temp_control_eta: float = 0.1,
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Train banks for the provided expert weight families with GPT-5 optimizations.
         
         Args:
             expert_weights: Dictionary of expert weights per family
             family_configs: Optional per-family configurations (rank, num_bases)
-            Other args: Training hyperparameters
+            Other args: Training hyperparameters including temperature control
         
         Returns:
-            Tuple of (results, normalizer) where results contains trained banks/codes/adapters
-            and normalizer contains z-score statistics for folding back into adapters.
+            Dictionary containing trained banks/codes/adapters per family.
         """
 
-        # Step 1: Z-score normalization per workflow
-        normalizer = None
+        # Work directly with expert weights (no normalization)
         working_weights = expert_weights
-        
-        if self.normalize_experts:
-            working_weights, normalizer = normalize_expert_families(expert_weights)
-            # Remove z-score logging to avoid step conflicts
 
         results: Dict[str, Dict[str, torch.Tensor]] = {}
 
@@ -127,12 +131,17 @@ class AlternatingBankTrainer:
                 device=self.device,
                 dtype=self.dtype,
                 target_support=target_support,
-                temperature=temperature_init,
-                min_temperature=min_temperature,
-                lambda_A=lambda_A,
-                lambda_B=lambda_B,
                 epsilon=epsilon,
                 seeding_config=self.seeding_config,
+                tau=tau,
+                lambda_A=lambda_A,
+                lambda_B=lambda_B,
+                lambda_T=lambda_T,
+                j_min=j_min,
+                eta=eta,
+                # route_w_start removed
+                temp_control_freq=temp_control_freq,
+                temp_control_eta=temp_control_eta,
             )
 
             A0, B0, energy, seeding_metrics = create_warm_start(W, rank, self.seeding_config)
@@ -146,32 +155,37 @@ class AlternatingBankTrainer:
             with torch.no_grad():
                 bank_module.bases.copy_(bank0)
 
-            # Use alpha directly instead of logits to avoid entmax drift
+            # Use alpha directly as mixture weights
             alpha = alpha0.clone()
             A = A0.to(self.device, self.dtype)
-            T = temperature_init
-            loss = 0.0
             
+            # Get pre-computed buffers for performance
+            I_r, I_m = self._get_identity_buffers(rank, num_bases)
+            
+            # Pre-compute normalized bank for coding efficiency
+            bank_unit_flat = None
+            
+            # Track relF history for adaptive scheduling
+            relF_history = []
 
             # Log initial energy capture and seeding metrics
             if log_wandb and wandb.run is not None:
-                seeding_log = {
-                    f"{family}/initial_energy_captured": energy.mean().item(),
-                    f"{family}/initial_energy_std": energy.std().item(),
-                }
-                # Add seeding-specific metrics
+                # Log seeding metrics to console only
+                seeding_summary = []
+                seeding_summary.append(f"energy={energy.mean().item():.3f}±{energy.std().item():.3f}")
                 for key, value in seeding_metrics.items():
                     if isinstance(value, (int, float)):
-                        seeding_log[f"{family}/seeding_{key}"] = value
-                    elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float)):
-                        # Log first few values of lists
-                        seeding_log[f"{family}/seeding_{key}_first"] = value[0]
-                        if len(value) > 1:
-                            seeding_log[f"{family}/seeding_{key}_mean"] = sum(value) / len(value)
+                        seeding_summary.append(f"{key}={value:.3f}" if isinstance(value, float) else f"{key}={value}")
+                    elif isinstance(value, list) and len(value) > 0:
+                        seeding_summary.append(f"{key}_mean={sum(value) / len(value):.3f}")
                 
-                wandb.log(seeding_log)
+                print(f"      Seeding: {', '.join(seeding_summary)}")
 
             print(f"      Training {family.upper()} family:")
+            
+            # Calculate global step offset to avoid WandB step conflicts
+            global_step_offset = getattr(self, '_wandb_step_counter', 0)
+            
             for step in range(num_steps):
                 # Simple progress bar
                 progress = (step + 1) / num_steps
@@ -180,273 +194,99 @@ class AlternatingBankTrainer:
                 bar = '█' * filled_length + '░' * (bar_length - filled_length)
                 print(f"\r      [{bar}] {step+1:2d}/{num_steps} steps | ", end="", flush=True)
                 
-                alpha, A, loss, T, med, metrics = am_step(
-                    W, B0, bank_module, alpha, A, T, cfg, step=step,
-                    log_metrics=log_wandb
+                # Update pre-computed normalized bank for coding
+                if step > 0:  # After first update
+                    with torch.no_grad():
+                        D = bank_module.bases.view(num_bases, -1).to(cfg.dtype if cfg.dtype == torch.float32 else torch.float32)
+                        bank_unit_flat = D / (D.norm(dim=-1, keepdim=True).clamp_min(1e-8))
+                
+                # Determine current hyperparameter values based on step and phase
+                current_lambda = cfg.activation_lambda
+                current_beta = cfg.route_beta
+                
+                # Decide if we should use weight-aware targets
+                # For λ=0, after initial steps, switch to weight-aware targets
+                use_weight_aware = (current_lambda == 0.0 and step >= 2)
+                
+                alpha, A, loss, seff_median, metrics = am_step(
+                    W, B0, bank_module, alpha, A, cfg, step=step,
+                    log_metrics=log_wandb,
+                    I_r=I_r, I_m=I_m, bank_unit_flat=bank_unit_flat,
+                    activation_lambda=current_lambda,
+                    route_beta=current_beta,
+                    use_weight_aware_targets=use_weight_aware
                 )
+                
+                # Temperature control
+                update_temperature(cfg, seff_median, step)
+                
+                # Adaptive scheduling for activation homotopy and route blending
+                relF_history.append(metrics.get('recon/relative_frobenius_error', 1.0))
+                adaptive_actions = update_adaptive_schedule(cfg, metrics, step, relF_history)
+                
+                # Update hyperparameters based on adaptive scheduling
+                # This ensures the next iteration uses the updated values
+                # (cfg is modified in-place by update_adaptive_schedule)
 
-                # Update progress bar with current metrics
+                # Update progress bar with current metrics (including adaptive info)
                 rel_frob = metrics.get("recon/relative_frobenius_error", float("nan"))
+                lambda_val = cfg.activation_lambda
+                beta_val = cfg.route_beta
+                phase = metrics.get("adaptive/phase", 0)
+                phase_name = ["Linear", "Transition", "Nonlinear"][int(phase)]
+                tau_display = f"τ={cfg.tau:.2f}"
+                adaptive_display = f"λ={lambda_val:.2f},β={beta_val:.2f},{phase_name}"
+                actions_display = adaptive_actions.get("actions", "")
+                if actions_display and actions_display != "stable":
+                    adaptive_display += f"[{actions_display}]"
                 print(
-                    f"Loss: {loss:.4f} | RelFrob: {rel_frob:.4f} | Support: {med:.1f} | T: {T:.2f}",
+                    f"Loss: {loss:.4f} | RelFrob: {rel_frob:.4f} | Seff: {seff_median:.1f} | {adaptive_display} | {tau_display}",
                     end="",
                     flush=True,
                 )
                 
                 if log_wandb and metrics and wandb.run is not None:
-                    # Prefix metrics with family name and log once
+                    # Prefix metrics with family name and log with proper step offset
                     family_metrics = {f"{family}/{k}": v for k, v in metrics.items()}
-                    family_metrics[f"{family}/step"] = step
-                    wandb.log(family_metrics, step=step)
+                    current_step = global_step_offset + step
+                    wandb.log(family_metrics, step=current_step)
             
-            # Complete the progress bar
+            # Complete the progress bar (including final adaptive state)
             final_rel = metrics.get("recon/relative_frobenius_error", float("nan"))
+            final_lambda = cfg.activation_lambda
+            final_beta = cfg.route_beta
+            final_phase = metrics.get("adaptive/phase", 0)
+            final_phase_name = ["Linear", "Transition", "Nonlinear"][int(final_phase)]
+            final_tau = f"τ={cfg.tau:.2f}"
+            final_adaptive = f"λ={final_lambda:.2f},β={final_beta:.2f},{final_phase_name}"
             print(
-                f"\r      [{'█' * bar_length}] {num_steps:2d}/{num_steps} steps | Final - Loss: {loss:.4f} | RelFrob: {final_rel:.4f} | Support: {med:.1f} | T: {T:.2f}"
+                f"\r      [{'█' * bar_length}] {num_steps:2d}/{num_steps} steps | Final - Loss: {loss:.4f} | RelFrob: {final_rel:.4f} | Seff: {seff_median:.1f} | {final_adaptive} | {final_tau}"
             )
+            
+            # Update step counter for next family
+            if not hasattr(self, '_wandb_step_counter'):
+                self._wandb_step_counter = 0
+            self._wandb_step_counter += num_steps
             print(f"      ✅ {family.upper()} training completed!")
             
-            # alpha is already the final mixture weights (no need to convert from logits)
+            # Store final mixture weights
             final_alpha = alpha
             
-            # Store results (adapters will be folded later if normalization was used)
+            # Store results
             results[family] = {
                 "bank": bank_module.bases.detach(),
                 "codes": final_alpha.detach(),
                 "adapters": A.detach(),
             }
 
-        return results, normalizer
-
-
-def fold_normalization_into_adapters(
-    results: Dict[str, Dict[str, torch.Tensor]],
-    normalizer: ZScoreNormalizer
-) -> Dict[str, Dict[str, torch.Tensor]]:
-    """Fold row-wise z-score scaling back into adapter matrices.
-
-    The training loop operates on normalised weights ``W¯``.  To deploy the
-    learned adapters in the original space we need to left-multiply them by the
-    diagonal scaling matrix ``D`` defined during normalisation.  Since we do not
-    centre the weights, this reduces to a simple row-wise multiplication.
-    """
-    if normalizer is None:
         return results
 
-    folded_results: Dict[str, Dict[str, torch.Tensor]] = {}
-    for family, family_results in results.items():
-        if family not in normalizer.stats:
-            folded_results[family] = family_results
-            continue
-
-        stats = normalizer.stats[family]
-        adapters = family_results["adapters"]  # E × p × r
-
-        # ``stats.std`` has shape ``p × d`` with the same value repeated across
-        # the hidden dimension.  Extract the per-row scale and broadcast to the
-        # adapter shape.
-        row_scale = stats.std[:, 0].view(1, -1, 1)  # 1 × p × 1
-        A_folded = adapters * row_scale
-
-        folded_results[family] = {**family_results, "adapters": A_folded}
-
-    return folded_results
 
 
-def build_dual_globe_bank(
-    results: Dict[str, Dict[str, torch.Tensor]], 
-    activation: str = "silu"
-) -> DualGloBEBank:
-    """Build a DualGloBEBank from training results.
-    
-    Args:
-        results: Training results containing banks for 'up' and 'gate' families
-        activation: Activation function for the banks
-        
-    Returns:
-        DualGloBEBank instance with trained parameters
-    """
-    if "up" not in results or "gate" not in results:
-        raise ValueError("Results must contain both 'up' and 'gate' families")
-    
-    up_bank_data = results["up"]["bank"]  # m_up × r × d
-    gate_bank_data = results["gate"]["bank"]  # m_gate × r × d
-    
-    num_bases_up, rank, hidden_dim = up_bank_data.shape
-    num_bases_gate = gate_bank_data.shape[0]
-    
-    # Create dual bank
-    dual_bank = DualGloBEBank(
-        num_bases_up=num_bases_up,
-        num_bases_gate=num_bases_gate,
-        rank=rank,
-        hidden_dim=hidden_dim,
-        activation=activation
-    )
-    
-    # Load trained parameters
-    dual_bank.up_bank.bases.data.copy_(up_bank_data)
-    dual_bank.gate_bank.bases.data.copy_(gate_bank_data)
-    
-    return dual_bank
+
+# Legacy functions removed - focusing only on core bank training
+# build_dual_globe_bank and create_globe_ffn_from_results moved to test files if needed
 
 
-def create_globe_ffn_from_results(
-    results: Dict[str, Dict[str, torch.Tensor]],
-    layer_idx: int,
-    hidden_dim: int,
-    intermediate_dim: int,
-    activation: str = "silu",
-    sparsity_config: Optional[Dict] = None,
-) -> "GloBEFFN":
-    """Create a complete GloBEFFN from training results.
-    
-    Args:
-        results: Training results from AlternatingBankTrainer
-        layer_idx: Layer index for the FFN
-        hidden_dim: Hidden dimension (d)
-        intermediate_dim: Intermediate FFN dimension (p)
-        activation: Activation function
-        sparsity_config: Configuration for SparseMixer
-        
-    Returns:
-        GloBEFFN instance ready for inference
-    """
-    from ..modules.ffn_globe import GloBEFFN  # Import here to avoid circular imports
-    
-    if "up" not in results or "gate" not in results:
-        raise ValueError("Results must contain both 'up' and 'gate' families")
-    
-    # Extract dimensions from results
-    up_bank_data = results["up"]["bank"]  # m_up × r × d
-    gate_bank_data = results["gate"]["bank"]  # m_gate × r × d
-    up_codes = results["up"]["codes"]  # E × m_up
-    gate_codes = results["gate"]["codes"]  # E × m_gate
-    up_adapters = results["up"]["adapters"]  # E × p × r
-    gate_adapters = results["gate"]["adapters"]  # E × p × r
-    
-    num_experts = up_codes.shape[0]
-    num_bases_up, rank, _ = up_bank_data.shape
-    num_bases_gate = gate_bank_data.shape[0]
-    
-    # Create global banks
-    global_banks = build_dual_globe_bank(results, activation)
-    
-    # Create sparse mixer
-    if sparsity_config is None:
-        sparsity_config = {"type": "entmax", "temperature": 1.0}
-    
-    sparse_mixer = SparseMixer(
-        sparsity_type=sparsity_config.get("type", "entmax"),
-        temperature=sparsity_config.get("temperature", 1.0),
-        l1_weight=sparsity_config.get("l1_weight", 1e-4),
-    )
-    
-    # Create GloBEFFN
-    globe_ffn = GloBEFFN(
-        layer_idx=layer_idx,
-        num_experts=num_experts,
-        hidden_dim=hidden_dim,
-        intermediate_dim=intermediate_dim,
-        num_bases_up=num_bases_up,
-        num_bases_gate=num_bases_gate,
-        rank=rank,
-        global_banks=global_banks,
-        sparse_mixer=sparse_mixer,
-        activation=activation,
-    )
-    
-    # Load trained parameters
-    globe_ffn.up_adapters.data.copy_(up_adapters)
-    globe_ffn.gate_adapters.data.copy_(gate_adapters)
-    globe_ffn.up_mixture_logits.data.copy_(up_codes.log())  # Convert codes back to logits
-    globe_ffn.gate_mixture_logits.data.copy_(gate_codes.log())
-    
-    # Note: down_projections need to be initialized separately as they're not trained
-    # in the current workflow (they remain as dense expert-specific weights)
-    
-    return globe_ffn
-
-
-# ---------------------------------------------------------------------------
-# Hydra entry point ---------------------------------------------------------
-
-
-@hydra.main(version_base=None, config_path="../../config", config_name="default")
-def main(cfg: DictConfig) -> None:
-    """Main training entry point with Hydra configuration."""
-
-    if cfg.wandb.mode != "disabled":
-        wandb.init(
-            project=cfg.wandb.project,
-            entity=cfg.wandb.entity,
-            name=cfg.wandb.run_name,
-            tags=cfg.wandb.tags,
-            config=dict(cfg),
-            mode=cfg.wandb.mode,
-        )
-
-    torch.manual_seed(cfg.seed)
-
-    expert_weights = extract_expert_weights(cfg.model.name_or_path)
-
-    up_dim = expert_weights["up"][0].shape[0]
-    gate_dim = expert_weights["gate"][0].shape[0]
-    rank_up = cfg.bank.r if cfg.bank.r else up_dim // 2
-    rank_gate = cfg.bank.r if cfg.bank.r else gate_dim // 2
-
-    # Train both families together to share normalization
-    trainer = AlternatingBankTrainer(
-        rank=rank_up,  # Default rank (will be overridden per family)
-        num_bases=cfg.bank.m_up,  # Default num_bases (will be overridden per family)
-        device=cfg.device,
-        normalize_experts=True,
-    )
-    
-    # Configure per-family settings
-    family_configs = {
-        "up": {"rank": rank_up, "num_bases": cfg.bank.m_up},
-        "gate": {"rank": rank_gate, "num_bases": cfg.bank.m_gate},
-    }
-    
-    # Train all families at once to ensure consistent normalization
-    all_results, normalizer = trainer.train(
-        expert_weights,
-        family_configs=family_configs,
-        num_steps=cfg.train.steps,
-        temperature_init=cfg.bank.init.temperature,
-        target_support=cfg.bank.init.target_support,
-        activation=cfg.bank.activation.type,
-        log_wandb=cfg.wandb.mode != "disabled",
-    )
-    
-    # Fold normalization back into adapters
-    results = fold_normalization_into_adapters(all_results, normalizer)
-    
-    # Save per-family checkpoints
-    for family in ["up", "gate"]:
-        if family in results:
-            out_path = os.path.join(os.getcwd(), f"{family}_bank.pt")
-            torch.save(results[family], out_path)
-    
-    # Save combined results for GloBEFFN initialization
-    combined_path = os.path.join(os.getcwd(), "globe_banks_combined.pt")
-    torch.save({
-        "results": results,
-        "normalizer": normalizer,
-        "config": dict(cfg),
-    }, combined_path)
-    
-    # Build and save DualGloBEBank for easy loading
-    if "up" in results and "gate" in results:
-        dual_bank = build_dual_globe_bank(results, activation=cfg.bank.activation.type)
-        dual_bank_path = os.path.join(os.getcwd(), "dual_globe_bank.pt")
-        torch.save(dual_bank.state_dict(), dual_bank_path)
-
-    if cfg.wandb.mode != "disabled":
-        wandb.finish()
-
-
-if __name__ == "__main__":
-    main()
+# End of file
 

@@ -14,16 +14,17 @@ import torch.nn.functional as F
 import argparse
 import json
 import wandb
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 # Add the project root to the path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
-from globe.data.naming_qwen15 import extract_expert_weights, extract_all_expert_info
-from globe.train.fit_banks import AlternatingBankTrainer, fold_normalization_into_adapters, build_dual_globe_bank
+from globe.data.naming_qwen15 import extract_expert_weights, extract_all_expert_info, Qwen15MoETensorNaming
+from globe.train.fit_banks import AlternatingBankTrainer
 from globe.init.init_bank import InitConfig
 from globe.init.warm_start import SeedingMethod, SeedingConfig, get_seeding_method_info
+from globe.modules.globe_bank import DualGloBEBank
 
 
 def get_model_dtype(model_name: str) -> torch.dtype:
@@ -50,17 +51,23 @@ def train_banks_minimal_test(
     log_wandb: bool = False,
     seeding_method: str = "ts_pca",
     # Conservative hyperparameters
-    temperature_init: float = 1.5,
-    min_temperature: float = 1.0,
-    target_support: int = 16,
-    lambda_A: float = 1e-5,
-    lambda_B: float = 1e-4,
+    target_support: int = 8,  # Lower target to allow more sharing initially
     epsilon: float = 1e-4,
+    # JW-MOD parameters
+    tau: float = 1.0,
+    lambda_A: float = 1e-4,
+    lambda_B: float = 1e-4,
+    lambda_T: float = 1e-4,
+    j_min: float = 1e-3,
+    eta: float = 0.5,
+    # route_w_start removed - superseded by λ/β scheduling
+    # Temperature control
+    temp_control_freq: int = 5,
+    temp_control_eta: float = 0.1,
 ) -> Dict[str, Any]:
-    """Run a minimal bank training test."""
-    # Get dimensions from first expert
+    """Run a minimal bank training test - UP family only."""
+    # Get dimensions from first expert (UP only)
     up_dim, hidden_dim = expert_weights['up'][0].shape  # projection_dim × hidden_dim
-    gate_dim = expert_weights['gate'][0].shape[0]
     num_experts = len(expert_weights['up'])
     
     # Calculate scaled parameters
@@ -77,16 +84,16 @@ def train_banks_minimal_test(
     seeding_config = SeedingConfig(method=seeding_enum)
     method_info = get_seeding_method_info()[seeding_method.lower()]
     
-    print(f"\n🚀 Starting minimal bank training test...")
+    print(f"\n🚀 Starting stable bank training test...")
     print(f"   - Steps: {num_steps}")
     print(f"   - Rank: {rank} ({rank_ratio:.1%} of projection dim)")
     print(f"   - Num bases: {num_bases} ({basis_ratio:.1%} of experts)")
     print(f"   - Seeding method: {method_info['name']}")
     print(f"   - Method description: {method_info['description']}")
     print(f"   - Speed: {method_info['speed']}, Quality: {method_info['quality']}, MPS-friendly: {method_info['mps_friendly']}")
-    print(f"   - Temperature: {temperature_init} (min: {min_temperature})")
     print(f"   - Target support: {target_support}")
-    print(f"   - Regularization: λ_A={lambda_A}, λ_B={lambda_B}")
+    print(f"   - JW-MOD: tau={tau}, eta={eta}")
+    print(f"   - Regularization: λ_A={lambda_A}, λ_B={lambda_B}, λ_T={lambda_T}")
     print(f"   - Epsilon: {epsilon}")
     
     # Auto-detect device
@@ -110,7 +117,6 @@ def train_banks_minimal_test(
     
     print(f"📏 Expert dimensions:")
     print(f"   - Up: {up_dim} × {hidden_dim}")
-    print(f"   - Gate: {gate_dim} × {hidden_dim}")
     print(f"   - Number of experts: {num_experts}")
     print(f"📐 Computed parameters:")
     print(f"   - Rank: {rank} (ratio: {rank_ratio:.2f})")
@@ -122,56 +128,58 @@ def train_banks_minimal_test(
         num_bases=num_bases,
         device=device,
         dtype=model_dtype,
-        normalize_experts=True,
+        normalize_experts=False,
         seeding_config=seeding_config
     )
     
-    # Configure per-family settings
+    # Configure for UP family only
     family_configs = {
         "up": {"rank": rank, "num_bases": num_bases},
-        "gate": {"rank": rank, "num_bases": num_bases},
     }
     
     print(f"🔄 Training banks...")
     try:
-        # Train banks with conservative hyperparameters
-        results, normalizer = trainer.train(
+        # Train banks with staged training hyperparameters
+        results = trainer.train(
             expert_weights,
             family_configs=family_configs,
             num_steps=num_steps,
-            temperature_init=temperature_init,
             target_support=target_support,
             activation="silu",
             log_wandb=log_wandb,
-            min_temperature=min_temperature,
+            epsilon=epsilon,
+            tau=tau,
             lambda_A=lambda_A,
             lambda_B=lambda_B,
-            epsilon=epsilon,
+            lambda_T=lambda_T,
+            j_min=j_min,
+            eta=eta,
+            # route_w_start removed
+            temp_control_freq=temp_control_freq,
+            temp_control_eta=temp_control_eta,
         )
         
         print(f"✅ Training completed!")
         
-        # Analyze results
-        for family in ['up', 'gate']:
-            if family in results:
-                bank_shape = results[family]['bank'].shape
-                codes_shape = results[family]['codes'].shape
-                adapters_shape = results[family]['adapters'].shape
-                print(f"📊 {family.upper()} results:")
-                print(f"   - Bank shape: {bank_shape}")
-                print(f"   - Codes shape: {codes_shape}")
-                print(f"   - Adapters shape: {adapters_shape}")
-                
-                # Check sparsity
-                codes = results[family]['codes']
-                sparsity = (codes < 1e-6).float().mean().item()
-                support_sizes = (codes > 1e-6).sum(dim=1).float()
-                print(f"   - Sparsity: {sparsity:.3f}")
-                print(f"   - Mean support size: {support_sizes.mean().item():.1f}")
+        # Analyze results (UP family only)
+        if 'up' in results:
+            bank_shape = results['up']['bank'].shape
+            codes_shape = results['up']['codes'].shape
+            adapters_shape = results['up']['adapters'].shape
+            print(f"📊 UP results:")
+            print(f"   - Bank shape: {bank_shape}")
+            print(f"   - Codes shape: {codes_shape}")
+            print(f"   - Adapters shape: {adapters_shape}")
+            
+            # Check sparsity
+            codes = results['up']['codes']
+            sparsity = (codes < 1e-6).float().mean().item()
+            support_sizes = (codes > 1e-6).sum(dim=1).float()
+            print(f"   - Sparsity: {sparsity:.3f}")
+            print(f"   - Mean support size: {support_sizes.mean().item():.1f}")
         
         return {
             "results": results,
-            "normalizer": normalizer,
             "device": device,
             "config": {
                 "rank": rank,
@@ -194,23 +202,18 @@ def test_reconstruction_quality(training_output: Dict[str, Any], expert_weights:
     """Test reconstruction quality of trained banks with NaN detection."""
     print(f"\n🔍 Testing reconstruction quality...")
     
-    # Fold row-wise normalisation back into the adapters so that we evaluate
-    # reconstruction in the original weight space.
-    results = fold_normalization_into_adapters(
-        training_output["results"], training_output["normalizer"]
-    )
+    # Work directly with results (no normalization to fold)
+    results = training_output["results"]
     device = training_output["device"]
     
-    for family in ['up', 'gate']:
-        if family not in results:
-            continue
-            
-        print(f"\n📊 {family.upper()} reconstruction:")
+    # Test UP family only
+    if 'up' in results:
+        print(f"\n📊 UP reconstruction:")
         
         # Get components
-        bank = results[family]['bank'].to(device)  # m × r × d
-        codes = results[family]['codes'].to(device)  # E × m
-        adapters = results[family]['adapters'].to(device)  # E × p × r
+        bank = results['up']['bank'].to(device)  # m × r × d
+        codes = results['up']['codes'].to(device)  # E × m
+        adapters = results['up']['adapters'].to(device)  # E × p × r
         
         # Debug: Check for NaN/Inf in components
         bank_nans = torch.isnan(bank).sum().item()
@@ -232,7 +235,7 @@ def test_reconstruction_quality(training_output: Dict[str, Any], expert_weights:
         print(f"   📊 Codes sparsity: {codes_sparsity:.3f}, exact zeros: {codes_zeros:.3f}")
         
         # Original weights - ensure consistent dtype with bank
-        original_weights = torch.stack(expert_weights[family]).to(device, dtype=bank.dtype)  # E × p × d
+        original_weights = torch.stack(expert_weights['up']).to(device, dtype=bank.dtype)  # E × p × d
         
         # Reconstruct: W_i ≈ A_i @ (Σ_j α_{i,j} B_j)
         num_experts = codes.shape[0]
@@ -291,34 +294,60 @@ def test_reconstruction_quality(training_output: Dict[str, Any], expert_weights:
         print(f"   - MSE std: {per_expert_mse.std().item():.6f}")
 
 
-def test_dual_bank_creation(training_output: Dict[str, Any]):
-    """Test DualGloBEBank creation from results."""
-    print(f"\n🔧 Testing DualGloBEBank creation...")
+def test_single_bank_module(training_output: Dict[str, Any]):
+    """Test single UP bank module."""
+    print(f"\n🏗️  Testing UP bank module...")
     
-    try:
-        dual_bank = build_dual_globe_bank(training_output["results"], activation="silu")
-        print(f"✅ DualGloBEBank created successfully!")
-        print(f"   - Up bank shape: {dual_bank.up_bank.bases.shape}")
-        print(f"   - Gate bank shape: {dual_bank.gate_bank.bases.shape}")
+    results = training_output["results"]
+    
+    if 'up' not in results:
+        print("❌ No UP bank to test")
+        return None
+    
+    # Just verify the UP bank
+    up_bank_data = results["up"]["bank"]  # m × r × d
+    print(f"✅ UP bank verified")
+    print(f"   - Shape: {up_bank_data.shape}")
+    
+    return up_bank_data
+
+
+def build_dual_globe_bank(
+    results: Dict[str, Dict[str, torch.Tensor]], 
+    activation: str = "silu"
+) -> DualGloBEBank:
+    """Build a DualGloBEBank from training results.
+    
+    Args:
+        results: Training results containing banks for 'up' and 'gate' families
+        activation: Activation function for the banks
         
-        # Test forward pass
-        batch_size = 4
-        num_bases_up = dual_bank.up_bank.bases.shape[0]
-        num_bases_gate = dual_bank.gate_bank.bases.shape[0]
-        
-        up_weights = torch.randn(batch_size, num_bases_up)
-        gate_weights = torch.randn(batch_size, num_bases_gate)
-        
-        up_mixed, gate_mixed = dual_bank(up_weights, gate_weights)
-        print(f"   - Test forward pass successful!")
-        print(f"   - Up mixed shape: {up_mixed.shape}")
-        print(f"   - Gate mixed shape: {gate_mixed.shape}")
-        
-        return dual_bank
-        
-    except Exception as e:
-        print(f"❌ DualGloBEBank creation failed: {e}")
-        raise
+    Returns:
+        DualGloBEBank instance with trained parameters
+    """
+    if "up" not in results or "gate" not in results:
+        raise ValueError("Results must contain both 'up' and 'gate' families")
+    
+    up_bank_data = results["up"]["bank"]  # m_up × r × d
+    gate_bank_data = results["gate"]["bank"]  # m_gate × r × d
+    
+    num_bases_up, rank, hidden_dim = up_bank_data.shape
+    num_bases_gate = gate_bank_data.shape[0]
+    
+    # Create dual bank
+    dual_bank = DualGloBEBank(
+        num_bases_up=num_bases_up,
+        num_bases_gate=num_bases_gate,
+        rank=rank,
+        hidden_dim=hidden_dim,
+        activation=activation
+    )
+    
+    # Load trained parameters
+    dual_bank.up_bank.bases.data.copy_(up_bank_data)
+    dual_bank.gate_bank.bases.data.copy_(gate_bank_data)
+    
+    return dual_bank
 
 
 def save_results(training_output: Dict[str, Any], output_dir: str = "test_output"):
@@ -329,7 +358,6 @@ def save_results(training_output: Dict[str, Any], output_dir: str = "test_output
     output_path.mkdir(exist_ok=True)
     
     results = training_output["results"]
-    normalizer = training_output["normalizer"]
     config = training_output["config"]
     
     # Save individual family results
@@ -341,16 +369,14 @@ def save_results(training_output: Dict[str, Any], output_dir: str = "test_output
     # Save combined results
     torch.save({
         "results": results,
-        "normalizer": normalizer,
         "config": config,
     }, output_path / "globe_banks_combined.pt")
     print(f"✅ Saved globe_banks_combined.pt")
     
-    # Save DualGloBEBank
-    if "up" in results and "gate" in results:
-        dual_bank = build_dual_globe_bank(results, activation="silu")
-        torch.save(dual_bank.state_dict(), output_path / "dual_globe_bank.pt")
-        print(f"✅ Saved dual_globe_bank.pt")
+    # Save UP bank separately
+    if "up" in results:
+        torch.save(results["up"]["bank"], output_path / "up_bank.pt")
+        print(f"✅ Saved up_bank.pt")
     
     # Save config as JSON
     with open(output_path / "config.json", "w") as f:
@@ -369,19 +395,27 @@ def main():
     parser.add_argument("--output-dir", default="test_output", help="Output directory")
     parser.add_argument("--skip-download", action="store_true", help="Skip model download/analysis")
     parser.add_argument("--force-download", action="store_true", help="Force re-download even if cached")
-    parser.add_argument("--max-experts", type=int, default=128, help="Limit number of experts (default: 128 for memory efficiency)")
+    parser.add_argument("--layers", type=str, default=None, help="Extract experts from specific layers (e.g., '12' or '12,13,14')")
+    parser.add_argument("--max-experts", type=int, default=128, help="Limit number of experts (default: 128)")
+    parser.add_argument("--sample-method", default="first_n", choices=["first_n", "evenly_spaced"], help="How to sample experts when limiting")
+    parser.add_argument("--families", default="up", choices=["up", "gate", "both"], help="Which expert families to train (default: up)")
     parser.add_argument("--no-cache", action="store_true", help="Disable caching (for memory-constrained systems)")
     parser.add_argument("--wandb-project", default="globe-bank-training", help="Wandb project name")
     parser.add_argument("--wandb-name", default=None, help="Wandb run name")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--seeding-method", default="ts_pca", choices=["svd", "ts_pca", "left_gram_pca", "spherical_kmeans", "residual_greedy", "hybrid"], help="Seeding method for bank initialization")
-    # Conservative hyperparameters for stability
-    parser.add_argument("--temperature-init", type=float, default=1.5, help="Initial temperature (lower for stability)")
-    parser.add_argument("--min-temperature", type=float, default=1.0, help="Minimum temperature to prevent support collapse")
-    parser.add_argument("--target-support", type=int, default=16, help="Target support size (higher for stability)")
-    parser.add_argument("--lambda-A", type=float, default=1e-5, help="Adapter regularization (higher for stability)")
-    parser.add_argument("--lambda-B", type=float, default=1e-4, help="Bank regularization")
-    parser.add_argument("--epsilon", type=float, default=1e-4, help="Sparsity threshold")
+    # JW-MOD hyperparameters
+    parser.add_argument("--target-support", type=int, default=16, help="Target support size (for compatibility)")
+    parser.add_argument("--tau", type=float, default=1.0, help="Softmax temperature")
+    parser.add_argument("--lambda-A", type=float, default=1e-4, help="Ridge for A-refit")
+    parser.add_argument("--lambda-B", type=float, default=1e-4, help="Ridge for MOD")
+    parser.add_argument("--lambda-T", type=float, default=1e-4, help="Ridge for pre-act target backsolve")
+    parser.add_argument("--j-min", type=float, default=1e-3, help="Jacobian floor")
+    parser.add_argument("--eta", type=float, default=0.5, help="JW-MOD step damping")
+    # --route-w-start removed - superseded by λ/β scheduling
+    parser.add_argument("--epsilon", type=float, default=1e-4, help="Support calculation threshold")
+    parser.add_argument("--temp-control-freq", type=int, default=5, help="Temperature control frequency")
+    parser.add_argument("--temp-control-eta", type=float, default=0.1, help="Temperature control rate")
     
     args = parser.parse_args()
     
@@ -410,7 +444,9 @@ def main():
                     "steps": args.steps,
                     "rank_ratio": args.rank_ratio,
                     "basis_ratio": args.basis_ratio,
-                    "max_experts": args.max_experts,
+                    "layers": args.layers,
+                    "sample_method": args.sample_method,
+                    "families": args.families,
                     "device": args.device,
                     "seeding_method": args.seeding_method,
                 },
@@ -428,7 +464,9 @@ def main():
                     "steps": args.steps,
                     "rank_ratio": args.rank_ratio,
                     "basis_ratio": args.basis_ratio,
-                    "max_experts": args.max_experts,
+                    "layers": args.layers,
+                    "sample_method": args.sample_method,
+                    "families": args.families,
                     "device": args.device,
                     "seeding_method": args.seeding_method,
                 },
@@ -439,17 +477,43 @@ def main():
             print(f"   💡 You can sync later with: wandb sync wandb/offline-run-*")
     
     try:
-        # Step 1: Extract expert weights with built-in caching and subset functionality
-        print(f"📤 Extracting routed expert weights (max: {args.max_experts})...")
+        # Parse layers argument
+        layers = None
+        if args.layers is not None:
+            try:
+                layers = [int(x.strip()) for x in args.layers.split(',')]
+            except ValueError:
+                print(f"❌ Invalid layers format: {args.layers}. Use format like '12' or '12,13,14'")
+                sys.exit(1)
+        
+        # Step 1: Extract expert weights
+        layer_info = ""
+        if layers is not None:
+            if len(layers) == 1:
+                layer_info = f" from layer {layers[0]}"
+            else:
+                layer_info = f" from layers {layers}"
+        print(f"📤 Extracting expert weights{layer_info}...")
+        
         expert_weights = extract_expert_weights(
             args.model, 
             include_shared=False,
             force_download=args.force_download,
-            max_experts=args.max_experts
+            max_experts=args.max_experts,
+            layers=layers,
+            sample_method=args.sample_method
         )
         
-        print(f"✅ Extracted {len(expert_weights['up'])} routed Up experts")
-        print(f"✅ Extracted {len(expert_weights['gate'])} routed Gate experts")
+        # Filter families based on user selection
+        if args.families == "up":
+            expert_weights = {"up": expert_weights["up"]}
+        elif args.families == "gate":
+            expert_weights = {"gate": expert_weights["gate"]}
+        # "both" keeps both families
+        
+        total_experts = sum(len(weights) for weights in expert_weights.values())
+        families_str = ", ".join([f"{len(weights)} {family.upper()}" for family, weights in expert_weights.items()])
+        print(f"✅ Using {total_experts} experts: {families_str}")
         
         # Step 3: Train banks
         training_output = train_banks_minimal_test(
@@ -461,19 +525,24 @@ def main():
             model_name=args.model,
             log_wandb=not args.no_wandb,
             seeding_method=args.seeding_method,
-            temperature_init=args.temperature_init,
-            min_temperature=args.min_temperature,
             target_support=args.target_support,
+            epsilon=args.epsilon,
+            tau=args.tau,
             lambda_A=args.lambda_A,
             lambda_B=args.lambda_B,
-            epsilon=args.epsilon,
+            lambda_T=args.lambda_T,
+            j_min=args.j_min,
+            eta=args.eta,
+            # route_w_start removed
+            temp_control_freq=args.temp_control_freq,
+            temp_control_eta=args.temp_control_eta,
         )
         
         # Step 4: Test reconstruction quality
         test_reconstruction_quality(training_output, expert_weights)
         
-        # Step 5: Test DualGloBEBank creation
-        dual_bank = test_dual_bank_creation(training_output)
+        # Step 5: Test single bank module
+        up_bank = test_single_bank_module(training_output)
         
         # Step 6: Save results
         save_results(training_output, args.output_dir)
